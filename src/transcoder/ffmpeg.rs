@@ -188,7 +188,6 @@ impl Transcoder for FfmpegTranscoder {
                 }
             }
             let _ = stdin.shutdown().await;
-            let _ = pump_tx.send(Err(TranscodeError::InputClosed)).await;
         });
 
         // Drain stderr into logs (bounded volume, never blocks the pipeline).
@@ -331,7 +330,7 @@ mod tests {
             .await
             .unwrap();
         let mut produced = 0usize;
-        while let Ok(item) = out.rx.recv().await {
+        while let Some(item) = out.rx.recv().await {
             match item {
                 Ok(b) => produced += b.len(),
                 Err(_) => break,

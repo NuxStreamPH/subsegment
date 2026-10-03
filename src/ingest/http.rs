@@ -197,7 +197,7 @@ async fn pump_loop(
     client: reqwest::Client,
     bc: BroadcastConfig,
     mountpoint: String,
-    _initial_info: UpstreamInfo,
+    initial_info: UpstreamInfo,
     mut pending: Option<reqwest::Response>,
     mut splitter: Option<IcyStreamSplitter>,
     bytes_tx: mpsc::Sender<Vec<u8>>,
@@ -206,6 +206,8 @@ async fn pump_loop(
 ) {
     let want_icy = matches!(bc.source.r#type, SourceType::Icecast | SourceType::Shoutcast);
     let read_timeout = cfg.limits.upstream_read_timeout();
+    // Track current upstream info for metadata rebuilds on reconnect.
+    let mut cur_info: Option<UpstreamInfo> = Some(initial_info);
 
     loop {
         // Obtain a body: either the one we already hold or a fresh connect.
@@ -217,9 +219,11 @@ async fn pump_loop(
                         crate::telemetry::metrics::UPSTREAM_RECONNECTS
                             .with_label_values(&[&mountpoint])
                             .inc();
-                        info = i;
+                        cur_info = Some(i);
                         splitter = s;
-                        let _ = meta_tx.send(initial_metadata(&bc, &info)).await;
+                        let _ = meta_tx
+                            .send(initial_metadata(&bc, cur_info.as_ref().expect("just assigned")))
+                            .await;
                         r.bytes_stream()
                     }
                     Err(_) => break, // cancelled while retrying

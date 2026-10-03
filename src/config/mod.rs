@@ -58,9 +58,9 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind: "0.0.0.0:8080".into(),
-            name: "NuxStream Stream Engine".into(),
+            name: "NuxStream-Subsegment".into(),
             log_json: false,
-            log_level: "info,nuxstream_engine=info".into(),
+            log_level: "info,nuxstream_subsegment=info".into(),
             shutdown_timeout_secs: 15,
         }
     }
@@ -403,7 +403,30 @@ mod tests {
 
     #[test]
     fn defaults_are_valid() {
-        AppConfig::default().validate().unwrap();
+        // Freshly-built default config is not deployable: it needs tokens and
+        // at least one broadcast. Validation must refuse to start that way.
+        assert!(AppConfig::default().validate().is_err());
+
+        let mut cfg = AppConfig::default();
+        cfg.security.api_tokens = vec!["tok".into()];
+        cfg.broadcasts.insert(
+            "radio".into(),
+            BroadcastConfig {
+                enabled: true,
+                source: SourceConfig {
+                    r#type: SourceType::Http,
+                    url: "https://stream.example.org/live".into(),
+                    headers: Default::default(),
+                },
+                station_name: None,
+                allowed_qualities: vec![],
+                allowed_codecs: vec![],
+                authentication_required: None,
+                tokens: vec![],
+                allow_passthrough: true,
+            },
+        );
+        cfg.validate().unwrap();
     }
 
     #[test]
@@ -443,7 +466,7 @@ broadcasts:
     }
 
     fn serde_yaml_helper(yaml: &str) -> AppConfig {
-        use figment::providers::{Format, Yaml};
+        use figment::providers::{Format, Serialized, Yaml};
         use figment::Figment;
         Figment::from(Serialized::defaults(AppConfig::default()))
             .merge(Yaml::string(yaml))
@@ -453,7 +476,7 @@ broadcasts:
 
     #[test]
     fn unknown_source_type_fails_extraction() {
-        use figment::providers::{Format, Yaml};
+        use figment::providers::{Format, Serialized, Yaml};
         use figment::Figment;
         let yaml = r#"
 broadcasts:
@@ -473,6 +496,9 @@ broadcasts:
     #[test]
     fn disabled_broadcast_still_parses() {
         let yaml = r#"
+security:
+  api_tokens:
+    - "tok"
 broadcasts:
   off_air:
     enabled: false

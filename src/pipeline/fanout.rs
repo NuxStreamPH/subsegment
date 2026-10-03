@@ -51,9 +51,18 @@ impl Inner {
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         let now = Instant::now();
                         let mut ls = slot.lag_since.lock().unwrap();
-                        let start = *ls.get_or_insert(now);
-                        if now.duration_since(start) >= self.lag_timeout {
-                            to_remove.push(*id);
+                        // Only *start* the lag timer if the queue was drained
+                        // since the last dispatch (i.e. the listener is
+                        // genuinely not consuming). A full-again queue right
+                        // after a successful send means the producer simply
+                        // outpaced a healthy consumer — reset instead.
+                        match ls.take() {
+                            Some(start) if now.duration_since(start) >= self.lag_timeout => {
+                                to_remove.push(*id);
+                            }
+                            _ => {
+                                *ls = Some(now);
+                            }
                         }
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => to_remove.push(*id),

@@ -119,10 +119,10 @@ async fn main() -> anyhow::Result<()> {
     let shutdown_manager = manager.clone();
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
+            let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+                .expect("installing SIGTERM handler");
             tokio::select! {
-                _ = signal::unix::signal(signal::unix::SignalKind::terminate())
-                    .expect("installing SIGTERM handler")
-                    .recv() => info!("SIGTERM received"),
+                _ = sigterm.recv() => info!("SIGTERM received"),
                 _ = signal::ctrl_c() => info!("SIGINT received"),
             }
             shutdown_manager.shutdown().await;

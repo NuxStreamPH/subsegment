@@ -78,7 +78,7 @@ impl IcyStreamSplitter {
         let mut out = SplitOutput::default();
         let mut i = 0usize;
         while i < data.len() {
-            if self.audio_remaining == 0 {
+            if self.audio_remaining == 0 && !self.in_meta_header && self.meta_remaining == 0 {
                 // A metadata section starts here: 1 length byte, then
                 // len*16 bytes of ASCII metadata.
                 self.in_meta_header = true;
@@ -225,9 +225,18 @@ mod tests {
 
     #[test]
     fn codec_sniff() {
-        assert_eq!(codec_from_content_type("audio/mp3").as_deref(), Some("mp3"));
-        assert_eq!(codec_from_content_type("audio/ogg; codecs=opus").as_deref(), Some("opus"));
-        assert_eq!(codec_from_content_type("video/mp4").as_deref(), Some("aac"));
+        assert_eq!(
+            codec_from_content_type(Some("audio/mp3")).as_deref(),
+            Some("mp3")
+        );
+        assert_eq!(
+            codec_from_content_type(Some("audio/ogg; codecs=opus")).as_deref(),
+            Some("opus")
+        );
+        assert_eq!(
+            codec_from_content_type(Some("video/mp4")).as_deref(),
+            Some("aac")
+        );
         assert_eq!(codec_from_content_type(None), None);
     }
 

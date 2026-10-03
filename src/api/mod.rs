@@ -4,4 +4,4 @@ pub mod health;
 pub mod routes;
 pub mod stream;
 
-pub use routes::build_router;
+pub use routes::{build_router, AppState};

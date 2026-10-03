@@ -207,7 +207,7 @@ fn looks_like_ip_port(addr: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    // items used via fully-qualified paths in this module
     use crate::config::*;
     use crate::types::SourceType;
 

@@ -87,6 +87,12 @@ impl EngineError {
     /// Client-safe message. Never contains URLs, tokens or config values.
     pub fn safe_message(&self) -> String {
         match self {
+            // Internal details (URLs, hostnames, library errors) must never
+            // reach clients; they stay in the logs via `Display`/tracing.
+            EngineError::Internal(_) => "internal error".to_string(),
+            // Config validation runs at startup (operator-facing), so the
+            // message may quote offending values; it never reaches clients.
+            EngineError::Config(m) => m.clone(),
             EngineError::BadParameter(m) => m.clone(),
             other => other.to_string(),
         }
@@ -138,8 +144,10 @@ mod tests {
     fn safe_message_hides_internals() {
         let e = EngineError::internal(anyhow::anyhow!("failed connecting to https://secret-host"));
         assert!(!e.safe_message().contains("secret-host"));
-        assert_eq!(e.safe_message(), "internal error: failed connecting to https://secret-host");
+        assert_eq!(e.safe_message(), "internal error");
         // `code` is what clients see structurally:
         assert_eq!(e.code(), "internal_error");
+        // Full detail stays available for logs (never sent to clients).
+        assert!(format!("{e}").contains("secret-host"));
     }
 }

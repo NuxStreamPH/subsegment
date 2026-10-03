@@ -184,9 +184,10 @@ mod tests {
         let mut c = cfg();
         c.security.allow_private_upstream_addresses = true;
         c.security.upstream_host_allowlist = vec!["internal.radio.lan".into()];
-        // With private allowed we skip DNS policy entirely.
-        assert!(check_upstream_url(&c, "http://127.0.0.1/live").is_ok());
-        // But unknown hosts still fail the allowlist.
+        // Allowlisted host + private permitted: DNS policy skipped entirely.
+        assert!(check_upstream_url(&c, "http://internal.radio.lan/live").is_ok());
+        // Non-allowlisted hosts still fail the allowlist before any network check.
+        assert!(check_upstream_url(&c, "http://127.0.0.1/live").is_err());
         assert!(check_upstream_url(&c, "http://evil.example/live").is_err());
     }
 

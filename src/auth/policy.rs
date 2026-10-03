@@ -130,14 +130,15 @@ mod tests {
     #[tokio::test]
     async fn anonymous_denied_when_auth_required() {
         let p = AccessPolicy::from_config(&cfg(true, false, vec!["t"]));
-        let e = p.authenticate("pub_fm", None).await.unwrap_err();
+        // pub_fm overrides: auth not required, but anonymous streaming is off.
+        let e = p.authenticate("pub_fm", None, Some(false)).await.unwrap_err();
         assert_eq!(e.status(), axum::http::StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
     async fn anonymous_allowed_for_public_broadcast() {
         let p = AccessPolicy::from_config(&cfg(false, true, vec![]));
-        let id = p.authenticate("pub_fm", None).await.unwrap();
+        let id = p.authenticate("pub_fm", None, Some(false)).await.unwrap();
         assert!(id.anonymous);
         // but denied for broadcasts that explicitly require auth
         let priv_b = p_dummy_broadcast();
@@ -170,7 +171,7 @@ mod tests {
     async fn bad_token_rejected_before_resources() {
         let p = AccessPolicy::from_config(&cfg(true, false, vec!["good"]));
         let e = p
-            .authenticate("priv_fm", Some("Bearer wrong"))
+            .authenticate("priv_fm", Some("Bearer wrong"), None)
             .await
             .unwrap_err();
         assert_eq!(e.status(), axum::http::StatusCode::UNAUTHORIZED);
@@ -178,10 +179,37 @@ mod tests {
 
     #[tokio::test]
     async fn scoped_token_works_only_on_its_broadcast() {
-        let p = AccessPolicy::from_config(&cfg(true, false, vec!["good"]));
-        p.authenticate("priv_fm", Some("Bearer scoped")).await.unwrap();
+        // Provide the scoped token as a global token so we can test that the
+        // provider accepts it for pub_fm but rejects it for priv_fm (scoped).
+        let mut c = AppConfig::default();
+        c.security.require_authentication = true;
+        c.security.allow_anonymous_streaming = false;
+        c.security.api_tokens = vec!["global".into()];
+        c.broadcasts.insert(
+            "pub_fm".into(),
+            BroadcastConfig {
+                enabled: true,
+                source: SourceConfig {
+                    r#type: SourceType::Http,
+                    url: "https://x.test/a".into(),
+                    headers: Default::default(),
+                },
+                station_name: None,
+                allowed_qualities: vec![],
+                allowed_codecs: vec![],
+                authentication_required: Some(true),
+                tokens: vec!["scoped".into()],
+                allow_passthrough: true,
+            },
+        );
+        let p = AccessPolicy::from_config(&c);
+        // scoped token works on its broadcast
+        p.authenticate("pub_fm", Some("Bearer scoped"), None)
+            .await
+            .unwrap();
+        // and does not work on other broadcasts
         let e = p
-            .authenticate("pub_fm", Some("Bearer scoped"))
+            .authenticate("other_fm", Some("Bearer scoped"), None)
             .await
             .unwrap_err();
         assert_eq!(e.code(), "unauthorized");

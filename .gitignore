@@ -1,2 +1,7 @@
-# Rust build artifacts and dependencies
+# Rust build artifacts
 target/
+
+# Environment files
+.env
+.env.local
+*.env.*
