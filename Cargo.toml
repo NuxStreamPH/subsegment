@@ -1,0 +1,53 @@
+[package]
+name = "nuxstream-stream-engine"
+version = "0.1.0"
+edition = "2021"
+description = "NuxStream Radio stream engine: ingest, normalize, transcode and serve live broadcast streams."
+license = "MIT"
+repository = "https://github.com/nuxstream/stream-engine"
+rust-version = "1.75"
+
+[lib]
+name = "nuxstream_engine"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nuxstream-stream-engine"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.7", features = ["macros"] }
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+figment = { version = "0.10", features = ["yaml", "env", "test"] }
+futures = "0.3"
+futures-util = "0.3"
+hmac = "0.12"
+ipnet = "2"
+num_cpus = "1"
+prometheus = { version = "0.13", default-features = false }
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "gzip"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["codec", "io"] }
+tower = { version = "0.5", features = ["limit"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[dev-dependencies]
+figment = { version = "0.10", features = ["yaml", "env", "test"] }
+tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
