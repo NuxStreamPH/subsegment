@@ -1,7 +1,7 @@
 //! The listener-facing stream endpoint.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use axum::extract::{ConnectInfo, Path, Request, State};
 use axum::http::header;
@@ -12,7 +12,7 @@ use tracing::debug;
 
 use crate::config::AppConfig;
 use crate::error::{EngineError, Result};
-use crate::pipeline::fanout::{FanEvent, Subscriber};
+use crate::pipeline::fanout::FanEvent;
 use crate::pipeline::manager::Attach;
 use crate::types::{Codec, Quality, StreamMetadata};
 
@@ -82,12 +82,11 @@ pub fn icy_block(md: &Option<StreamMetadata>) -> Vec<u8> {
 
 /// Wrap a subscriber stream into interleaved ICY chunks honoring metaint.
 async fn icy_interleaved(
-    sub: Subscriber,
+    mut rx: crate::pipeline::fanout::OwnedReceiver,
     meta: Arc<tokio::sync::RwLock<Option<StreamMetadata>>>,
     meta_int: u32,
     tx: tokio::sync::mpsc::Sender<std::result::Result<Vec<u8>, std::io::Error>>,
 ) {
-    let mut rx = sub.rx;
     let mut pending: Vec<u8> = Vec::new();
     let mut until_next_meta = meta_int;
     while let Some(ev) = rx.recv().await {
@@ -233,11 +232,12 @@ fn build_response(
         tokio::spawn(async move {
             match meta_int {
                 Some(mi) => {
-                    icy_interleaved(subscriber, metadata, mi, tx).await;
+                    let rx = subscriber.into_receiver();
+                    icy_interleaved(rx, metadata, mi, tx).await;
                 }
                 None => {
-                    let mut sub = subscriber;
-                    while let Some(ev) = sub.rx.recv().await {
+                    let mut rx = subscriber.into_receiver();
+                    while let Some(ev) = rx.recv().await {
                         match ev {
                             FanEvent::Audio(b) => {
                                 if tx.send(Ok(b.to_vec())).await.is_err() {
@@ -252,7 +252,7 @@ fn build_response(
             }
             manager.listener_left(&broadcast_c);
             debug!(key = %key_c, "listener detached");
-        })
+        });
     }
 
     let body = axum::body::Body::from_stream(ReceiverStream::new(rx));

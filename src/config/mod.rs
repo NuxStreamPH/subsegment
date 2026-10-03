@@ -85,6 +85,9 @@ pub struct SecurityConfig {
     pub requests_per_second_per_ip: u32,
     /// Burst allowance on top of the sustained rate.
     pub request_burst_per_ip: u32,
+    /// Byte interval used when interleaving ICY metadata into MP3/AAC
+    /// responses for clients that advertise `Icy-MetaData: 1`.
+    pub icy_metadata_interval_bytes: u32,
 }
 
 impl Default for SecurityConfig {
@@ -99,6 +102,7 @@ impl Default for SecurityConfig {
             max_header_bytes: 16 * 1024,
             requests_per_second_per_ip: 20,
             request_burst_per_ip: 40,
+            icy_metadata_interval_bytes: 16 * 1024,
         }
     }
 }
@@ -334,6 +338,8 @@ impl AppConfig {
             Figment,
         };
 
+        let explicit = path_override.is_some()
+            || std::env::var(ENV_CONFIG_PATH).is_ok();
         let path = path_override
             .or_else(|| std::env::var(ENV_CONFIG_PATH).ok().map(PathBuf::from))
             .unwrap_or_else(|| PathBuf::from("config.yaml"));
@@ -341,7 +347,7 @@ impl AppConfig {
         let mut fig = Figment::from(Serialized::defaults(AppConfig::default()));
         if path.exists() {
             fig = fig.merge(Yaml::file(&path));
-        } else if path_override.is_some() || std::env::var(ENV_CONFIG_PATH).is_ok() {
+        } else if explicit {
             return Err(EngineError::Config(format!(
                 "configuration file not found: {}",
                 path.display()

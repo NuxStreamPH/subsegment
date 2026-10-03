@@ -78,16 +78,55 @@ impl Inner {
     }
 }
 
-/// One subscription; dropping it detaches automatically.
+/// One subscription; dropping it detaches automatically — unless the
+/// receiver has been moved out via [`Subscriber::into_receiver`], in which
+/// case ownership (and the detach responsibility) transfers to the
+/// response-stream task that holds the inner handle.
 pub struct Subscriber {
-    pub rx: mpsc::Receiver<FanEvent>,
-    id: u64,
-    inner: Arc<Inner>,
+    rx: mpsc::Receiver<FanEvent>,
+    shared: Option<Arc<Shared>>,
 }
 
-impl Drop for Subscriber {
+struct Shared {
+    inner: Arc<Inner>,
+    id: u64,
+}
+
+impl Drop for Shared {
     fn drop(&mut self) {
+        // Detach happens when the *last* handle (outer or transferred inner)
+        // goes away, guaranteeing no leaked slots on client disconnect.
         self.inner.remove(self.id);
+    }
+}
+
+/// The transferred half: owns the receiver, detaches on drop.
+pub struct OwnedReceiver {
+    rx: mpsc::Receiver<FanEvent>,
+    _shared: Arc<Shared>,
+}
+
+impl OwnedReceiver {
+    /// Poll the next event (convenience mirroring `mpsc::Receiver::recv`).
+    pub async fn recv(&mut self) -> Option<FanEvent> {
+        self.rx.recv().await
+    }
+
+    /// Access the underlying receiver (e.g. to wrap into a `Stream`).
+    pub fn inner_mut(&mut self) -> &mut mpsc::Receiver<FanEvent> {
+        &mut self.rx
+    }
+}
+
+impl Subscriber {
+    /// Move the subscription into an owned receiver handle for the response
+    /// body task. The outer `Subscriber` becomes inert.
+    pub fn into_receiver(mut self) -> OwnedReceiver {
+        let shared = self.shared.take().expect("fresh subscriber");
+        OwnedReceiver {
+            rx: std::mem::replace(&mut self.rx, mpsc::channel(1).1),
+            _shared: shared,
+        }
     }
 }
 
@@ -137,8 +176,10 @@ impl Fanout {
         self.inner.count.fetch_add(1, Ordering::SeqCst);
         Subscriber {
             rx,
-            id,
-            inner: self.inner.clone(),
+            shared: Some(Arc::new(Shared {
+                inner: self.inner.clone(),
+                id,
+            })),
         }
     }
 

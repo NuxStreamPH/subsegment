@@ -100,9 +100,9 @@ pub fn validate(cfg: &AppConfig) -> Result<()> {
     let tc = &cfg.transcoding;
     if !KNOWN_BACKENDS.contains(&tc.backend.as_str()) {
         errors.push(format!(
-            "transcoding.backend '{0}' unknown (expected one of {KNOWNED_BACKENDS_HINT})",
+            "transcoding.backend '{}' unknown (expected one of {})",
             tc.backend,
-            KNOWN_BACKENDS_HINT = KNOWN_BACKENDS.join(", ")
+            KNOWN_BACKENDS.join(", ")
         ));
     }
     if tc.max_concurrent == 0 {
