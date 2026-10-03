@@ -11,8 +11,8 @@ use crate::error::{EngineError, Result};
 
 /// RAII permit for one listener slot at both global and broadcast level.
 pub struct ListenerPermit {
-    broadcast: String,
-    guard: LimitGuard,
+    pub broadcast: String,
+    guard: Arc<LimitGuard>,
 }
 
 impl Drop for ListenerPermit {
@@ -23,8 +23,8 @@ impl Drop for ListenerPermit {
 
 /// RAII permit for one transcoding pipeline slot.
 pub struct PipelinePermit {
-    guard: LimitGuard,
-    is_transcode: bool,
+    pub guard: Arc<LimitGuard>,
+    pub is_transcode: bool,
 }
 
 impl Drop for PipelinePermit {

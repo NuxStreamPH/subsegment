@@ -34,7 +34,12 @@ impl AccessPolicy {
     ///
     /// Order of operations guarantees no upstream/transcoder work happens
     /// until this returns Ok.
-    pub async fn authenticate(&self, mountpoint: &str, authorization: Option<&str>) -> Result<Identity> {
+    pub async fn authenticate(
+        &self,
+        mountpoint: &str,
+        authorization: Option<&str>,
+        broadcast_auth_required: Option<bool>,
+    ) -> Result<Identity> {
         let req = AuthRequest {
             authorization,
             mountpoint,
@@ -42,8 +47,9 @@ impl AccessPolicy {
 
         // Anonymous is only allowed when auth is globally off *and* anonymous
         // streaming is enabled, and the broadcast itself does not demand auth.
+        let auth_required = broadcast_auth_required.unwrap_or(self.require_authentication);
         if authorization.is_none() {
-            if self.require_authentication || !self.allow_anonymous_streaming {
+            if auth_required || !self.allow_anonymous_streaming {
                 return Err(map_auth_error(AuthError::Missing));
             }
             return Ok(Identity::anonymous());

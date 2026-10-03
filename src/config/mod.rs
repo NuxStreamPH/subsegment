@@ -246,6 +246,10 @@ pub struct TranscodingConfig {
     /// Concurrent transcode hard cap independent from limits (belt & braces).
     pub max_concurrent: usize,
     pub threads_per_pipeline: u32,
+    /// Bounded output queue length per pipeline.
+    pub output_queue_len: usize,
+    /// Set true when the local ffmpeg build includes libfdk_aac (HE-AAC).
+    pub aacplus_supported: bool,
 }
 
 impl Default for TranscodingConfig {
@@ -255,6 +259,8 @@ impl Default for TranscodingConfig {
             ffmpeg_path: "ffmpeg".into(),
             max_concurrent: 16,
             threads_per_pipeline: 2,
+            output_queue_len: 64,
+            aacplus_supported: false,
         }
     }
 }

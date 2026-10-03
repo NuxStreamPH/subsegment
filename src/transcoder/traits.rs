@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Mutex};
 
-use crate::types::Codec;
+use crate::types::{Codec, Quality};
 
 /// Input to a transcode: a bounded stream of raw upstream audio bytes.
 ///
@@ -36,10 +36,17 @@ pub struct TranscodedStream {
     pub rx: mpsc::Receiver<Result<Vec<u8>, TranscodeError>>,
 }
 
+impl TranscodedStream {
+    pub fn from_receiver(rx: mpsc::Receiver<Result<Vec<u8>, TranscodeError>>) -> Self {
+        Self { rx }
+    }
+}
+
 /// Encoding parameters resolved from quality/codec configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EncodingProfile {
     pub codec: Codec,
+    pub quality: crate::types::Quality,
     /// bits per second
     pub bitrate_bps: u32,
     pub sample_rate: u32,
@@ -52,6 +59,7 @@ impl EncodingProfile {
     pub fn new(codec: Codec, bitrate_bps: u32) -> Self {
         Self {
             codec,
+            quality: Quality::Medium,
             bitrate_bps,
             sample_rate: 44100,
             channels: 2,
