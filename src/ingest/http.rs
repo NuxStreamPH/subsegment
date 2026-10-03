@@ -197,7 +197,7 @@ async fn pump_loop(
     client: reqwest::Client,
     bc: BroadcastConfig,
     mountpoint: String,
-    mut info: UpstreamInfo,
+    _initial_info: UpstreamInfo,
     mut pending: Option<reqwest::Response>,
     mut splitter: Option<IcyStreamSplitter>,
     bytes_tx: mpsc::Sender<Vec<u8>>,
@@ -228,11 +228,13 @@ async fn pump_loop(
         };
         futures_util::pin_mut!(body);
 
-        let mut need_reconnect = false;
-        while let next = tokio::select! {
-            _ = cancel.notified() => break,
-            chunk = tokio::time::timeout(read_timeout, body.next()) => chunk,
-        } {
+        let need_reconnect;
+        loop {
+            let next = tokio::select! {
+                biased;
+                _ = cancel.notified() => { need_reconnect = false; break; }
+                chunk = tokio::time::timeout(read_timeout, body.next()) => chunk,
+            };
             match next {
                 Err(_) => {
                     warn!(%mountpoint, "upstream read timeout — reconnecting");
@@ -252,7 +254,7 @@ async fn pump_loop(
                 Ok(Some(Ok(b))) => {
                     crate::telemetry::metrics::BYTES_RECEIVED
                         .with_label_values(&[&mountpoint])
-                        .inc_by(b.len() as u64);
+                        .inc_by(b.len() as f64);
                     let out = match splitter.as_mut() {
                         Some(sp) => sp.push(&b),
                         None => icy::SplitOutput {

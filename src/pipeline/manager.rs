@@ -45,6 +45,7 @@ pub struct PipelineManager {
     cfg: Arc<AppConfig>,
     client: reqwest::Client,
     transcoder: Arc<dyn Transcoder>,
+    limits: Arc<crate::security::limits::LimitGuard>,
     entries: Arc<Mutex<HashMap<String, Entry>>>,
     shutting_down: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -54,11 +55,13 @@ impl PipelineManager {
         cfg: Arc<AppConfig>,
         client: reqwest::Client,
         transcoder: Arc<dyn Transcoder>,
+        limits: Arc<crate::security::limits::LimitGuard>,
     ) -> Self {
         Self {
             cfg,
             client,
             transcoder,
+            limits,
             entries: Arc::new(Mutex::new(HashMap::new())),
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -148,9 +151,19 @@ impl PipelineManager {
         }
 
         // ---- create a fresh pipeline -------------------------------------
+        // NB: everything below runs *without* holding the entries lock so a
+        // slow upstream connect or encoder spawn cannot stall other
+        // broadcasts. A rare duplicate creation under a race is harmless:
+        // the second entry simply gets replaced by the reaper later.
+        drop(g);
+
         let is_transcode = !spec.passthrough;
         let pipeline_permit = if is_transcode {
-            Some(listener_permit.guard.clone().acquire_pipeline(true)?)
+            Some(
+                self.limits
+                    .clone()
+                    .acquire_pipeline(true)?,
+            )
         } else {
             None
         };
@@ -185,27 +198,19 @@ impl PipelineManager {
             threads: self.cfg.transcoding.threads_per_pipeline,
         };
 
-        let encoded: TranscodedStream = if spec.passthrough {
-            // ORIGINAL: copy bytes unchanged; codec/content-type from source.
-            self.transcoder
-                .start(StreamInput::new(bytes_rx), profile.clone(), cancel.clone())
-                .await
-                .unwrap_or_else(|_| {
-                    // passthrough backend should not fail; fall back safely
-                    unreachable!("passthrough start cannot fail")
-                })
-        } else {
-            match self
-                .transcoder
-                .start(StreamInput::new(bytes_rx), profile.clone(), cancel.clone())
-                .await
-            {
-                Ok(s) => s,
-                Err(e) => {
-                    cancel.notify_waiters();
-                    warn!(%key, error = %e, "transcoder failed to start");
-                    return Err(EngineError::UpstreamUnavailable);
-                }
+        let encoded: TranscodedStream = match self
+            .transcoder
+            .start(StreamInput::new(bytes_rx), profile, cancel.clone())
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                cancel.notify_waiters();
+                crate::telemetry::metrics::TRANSCODER_FAILURES
+                    .with_label_values(&[&spec.broadcast])
+                    .inc();
+                warn!(%key, error = %e, "transcoder failed to start");
+                return Err(EngineError::UpstreamUnavailable);
             }
         };
 
@@ -233,19 +238,21 @@ impl PipelineManager {
             self.cfg.limits.listener_queue_chunks,
             self.cfg.limits.listener_lag_timeout(),
         );
-        let metadata = Arc::new(RwLock::new::<Option<StreamMetadata>>(None));
+        let metadata = Arc::new(RwLock::new(None::<StreamMetadata>));
 
         // Pump: encoded audio + live metadata -> fanout.
         let pump_fan = fanout.clone();
         let pump_key = key.clone();
         let pump_broadcast = spec.broadcast.clone();
+        let pump_cancel = cancel.clone();
+        let pump_meta = metadata.clone();
         tokio::spawn(async move {
             let mut rx = encoded.rx;
             loop {
                 tokio::select! {
                     ev = meta_rx.recv() => {
                         if let Some(md) = ev {
-                            *metadata.write().await = Some(md.clone());
+                            *pump_meta.write().await = Some(md.clone());
                             pump_fan.publish(FanEvent::Metadata(Arc::new(md))).await;
                         }
                     }
@@ -254,7 +261,7 @@ impl PipelineManager {
                             Some(Ok(bytes)) => {
                                 crate::telemetry::metrics::BYTES_SENT
                                     .with_label_values(&[&pump_broadcast])
-                                    .inc_by(bytes.len() as u64);
+                                    .inc_by(bytes.len() as f64);
                                 pump_fan.publish(FanEvent::Audio(Arc::new(bytes))).await;
                             }
                             Some(Err(e)) => {
@@ -264,12 +271,13 @@ impl PipelineManager {
                             None => break,
                         }
                     }
-                    _ = cancel.notified() => break,
+                    _ = pump_cancel.notified() => break,
                 }
             }
             pump_fan.publish(FanEvent::End).await;
         });
 
+        let subscriber = fanout.subscribe();
         let entry = Entry {
             fanout: fanout.clone(),
             metadata: metadata.clone(),
@@ -281,7 +289,22 @@ impl PipelineManager {
             _permit: pipeline_permit,
             upstream_info: info,
         };
-        let subscriber = fanout.subscribe();
+
+        let mut g = self.entries.lock().await;
+        if let Some(existing) = g.get_mut(&key) {
+            // Lost a creation race — reuse the pipeline that won it and let
+            // the redundant one drain into the reaper naturally.
+            let sub = existing.fanout.subscribe();
+            return Ok(Attach {
+                subscriber: sub,
+                content_type: existing.content_type.clone(),
+                meta_int: if want_icy_meta { existing.meta_int } else { None },
+                bitrate_kbps: existing.bitrate_kbps,
+                metadata: existing.metadata.clone(),
+                _listener_permit: listener_permit,
+                _pipeline_permit: None,
+            });
+        }
         g.insert(key.clone(), entry);
         drop(g);
 

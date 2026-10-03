@@ -3,6 +3,8 @@
 pub mod metrics;
 pub mod request_id;
 
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt, EnvFilter};
 
 /// Initialize `tracing` exactly once. JSON output for production, plain
