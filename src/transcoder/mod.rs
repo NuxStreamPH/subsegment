@@ -6,9 +6,11 @@
 //! only a new implementor.
 
 pub mod ffmpeg;
+pub mod passthrough;
 pub mod traits;
 
 pub use ffmpeg::FfmpegTranscoder;
+pub use passthrough::PassthroughTranscoder;
 pub use traits::{EncodingProfile, StreamInput, TranscodeError, TranscodedStream, Transcoder};
 
 use crate::types::Codec;
