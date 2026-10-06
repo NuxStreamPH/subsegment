@@ -1,9 +1,11 @@
 //! Pipeline creation, reuse and teardown.
 
+use tokio_util::sync::CancellationToken;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, Mutex, Notify, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 use crate::config::AppConfig;
@@ -34,7 +36,7 @@ struct Entry {
     content_type: String,
     meta_int: Option<u32>,
     bitrate_kbps: Option<u32>,
-    cancel: Arc<Notify>,
+    cancel: CancellationToken,
     is_transcode: bool,
     _permit: Option<PipelinePermit>,
     upstream_info: UpstreamInfo,
@@ -48,6 +50,7 @@ pub struct PipelineManager {
     limits: Arc<crate::security::limits::LimitGuard>,
     entries: Arc<Mutex<HashMap<String, Entry>>>,
     shutting_down: Arc<std::sync::atomic::AtomicBool>,
+    shutdown_cancel: CancellationToken,
 }
 
 impl PipelineManager {
@@ -64,11 +67,13 @@ impl PipelineManager {
             limits,
             entries: Arc::new(Mutex::new(HashMap::new())),
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shutdown_cancel: CancellationToken::new(),
         }
     }
 
     pub fn is_shutting_down(&self) -> bool {
-        self.shutting_down.load(std::sync::atomic::Ordering::Relaxed)
+        self.shutting_down
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Snapshot of live pipeline keys for the status endpoint.
@@ -80,7 +85,11 @@ impl PipelineManager {
     }
 
     pub async fn upstream_info(&self, key: &str) -> Option<UpstreamInfo> {
-        self.entries.lock().await.get(key).map(|e| e.upstream_info.clone())
+        self.entries
+            .lock()
+            .await
+            .get(key)
+            .map(|e| e.upstream_info.clone())
     }
 
     /// Resolve a request into a concrete [`StreamSpec`] *before* touching
@@ -131,7 +140,10 @@ impl PipelineManager {
     ) -> Result<Attach> {
         let key = spec.key();
         let mut g = self.entries.lock().await;
-        if self.shutting_down.load(std::sync::atomic::Ordering::Relaxed) {
+        if self
+            .shutting_down
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return Err(EngineError::NotReady);
         }
         if let Some(e) = g.get_mut(&key) {
@@ -159,20 +171,17 @@ impl PipelineManager {
 
         let is_transcode = !spec.passthrough;
         let pipeline_permit = if is_transcode {
-            Some(
-                self.limits
-                    .clone()
-                    .acquire_pipeline(true)?,
-            )
+            Some(self.limits.clone().acquire_pipeline(true)?)
         } else {
             None
         };
 
-        let (bytes_tx, bytes_rx) = mpsc::channel::<Vec<u8>>(
-            self.cfg.limits.listener_queue_chunks.max(16),
-        );
+        let (bytes_tx, bytes_rx) =
+            mpsc::channel::<Vec<u8>>(self.cfg.limits.listener_queue_chunks.max(16));
         let (meta_tx, mut meta_rx) = mpsc::channel::<StreamMetadata>(16);
-        let cancel = Arc::new(Notify::new());
+        let cancel = self.shutdown_cancel.child_token();
+        // Includes client disconnect while attach is still awaiting startup.
+        let startup_guard = cancel.clone().drop_guard();
 
         let (info, _ingest_join) = ingest::spawn_ingest(
             self.cfg.clone(),
@@ -198,18 +207,35 @@ impl PipelineManager {
             threads: self.cfg.transcoding.threads_per_pipeline,
         };
 
-        let encoded: TranscodedStream = match self
+        let mut encoded: TranscodedStream = match self
             .transcoder
             .start(StreamInput::new(bytes_rx), profile, cancel.clone())
             .await
         {
             Ok(s) => s,
             Err(e) => {
-                cancel.notify_waiters();
+                cancel.cancel();
                 crate::telemetry::metrics::TRANSCODER_FAILURES
                     .with_label_values(&[&spec.broadcast])
                     .inc();
                 warn!(%key, error = %e, "transcoder failed to start");
+                return Err(EngineError::UpstreamUnavailable);
+            }
+        };
+
+        // Fail preflight before sending a successful HTTP response if both
+        // backends fail to produce output. The router owns the retry budget.
+        let first = tokio::select! {
+            _ = cancel.cancelled() => None,
+            result = tokio::time::timeout(std::time::Duration::from_secs(25), encoded.rx.recv()) => result.ok().flatten(),
+        };
+        let first = match first {
+            Some(Ok(bytes)) => bytes,
+            _ => {
+                cancel.cancel();
+                crate::telemetry::metrics::TRANSCODER_FAILURES
+                    .with_label_values(&[&spec.broadcast])
+                    .inc();
                 return Err(EngineError::UpstreamUnavailable);
             }
         };
@@ -238,7 +264,16 @@ impl PipelineManager {
             self.cfg.limits.listener_queue_chunks,
             self.cfg.limits.listener_lag_timeout(),
         );
+        let fanout = if is_transcode && spec.codec == Codec::Opus {
+            fanout.with_ogg_headers()
+        } else {
+            fanout
+        };
         let metadata = Arc::new(RwLock::new(None::<StreamMetadata>));
+
+        // Subscribe before publishing container headers or fast startup output.
+        let subscriber = fanout.subscribe();
+        fanout.publish(FanEvent::Audio(Arc::new(first))).await;
 
         // Pump: encoded audio + live metadata -> fanout.
         let pump_fan = fanout.clone();
@@ -248,13 +283,14 @@ impl PipelineManager {
         let pump_meta = metadata.clone();
         tokio::spawn(async move {
             let mut rx = encoded.rx;
+            let mut metadata_open = true;
             loop {
                 tokio::select! {
-                    ev = meta_rx.recv() => {
+                    ev = meta_rx.recv(), if metadata_open => {
                         if let Some(md) = ev {
                             *pump_meta.write().await = Some(md.clone());
                             pump_fan.publish(FanEvent::Metadata(Arc::new(md))).await;
-                        }
+                        } else { metadata_open = false; }
                     }
                     chunk = rx.recv() => {
                         match chunk {
@@ -271,13 +307,12 @@ impl PipelineManager {
                             None => break,
                         }
                     }
-                    _ = pump_cancel.notified() => break,
+                    _ = pump_cancel.cancelled() => break,
                 }
             }
             pump_fan.publish(FanEvent::End).await;
+            pump_cancel.cancel();
         });
-
-        let subscriber = fanout.subscribe();
         let entry = Entry {
             fanout: fanout.clone(),
             metadata: metadata.clone(),
@@ -291,14 +326,24 @@ impl PipelineManager {
         };
 
         let mut g = self.entries.lock().await;
+        if self.is_shutting_down() {
+            return Err(EngineError::NotReady);
+        }
         if let Some(existing) = g.get_mut(&key) {
-            // Lost a creation race — reuse the pipeline that won it and let
-            // the redundant one drain into the reaper naturally.
+            // A redundant session has no reaper: cancel it immediately.
+            cancel.cancel();
             let sub = existing.fanout.subscribe();
+            crate::telemetry::metrics::LISTENERS
+                .with_label_values(&[&spec.broadcast])
+                .inc();
             return Ok(Attach {
                 subscriber: sub,
                 content_type: existing.content_type.clone(),
-                meta_int: if want_icy_meta { existing.meta_int } else { None },
+                meta_int: if want_icy_meta {
+                    existing.meta_int
+                } else {
+                    None
+                },
                 bitrate_kbps: existing.bitrate_kbps,
                 metadata: existing.metadata.clone(),
                 _listener_permit: listener_permit,
@@ -309,14 +354,29 @@ impl PipelineManager {
         drop(g);
 
         crate::telemetry::metrics::PIPELINES_CREATED
-            .with_label_values(&[&spec.broadcast, if is_transcode { "transcode" } else { "passthrough" }])
+            .with_label_values(&[
+                &spec.broadcast,
+                if is_transcode {
+                    "transcode"
+                } else {
+                    "passthrough"
+                },
+            ])
             .inc();
         crate::telemetry::metrics::PIPELINES
-            .with_label_values(&[&spec.broadcast, if is_transcode { "transcode" } else { "passthrough" }])
+            .with_label_values(&[
+                &spec.broadcast,
+                if is_transcode {
+                    "transcode"
+                } else {
+                    "passthrough"
+                },
+            ])
             .inc();
         crate::telemetry::metrics::LISTENERS
             .with_label_values(&[&spec.broadcast])
             .inc();
+        startup_guard.disarm();
         info!(%key, "pipeline created");
 
         // Reaper: detach pipeline after grace period without listeners.
@@ -326,13 +386,20 @@ impl PipelineManager {
         let reaper_cancel = cancel.clone();
         tokio::spawn(async move {
             loop {
-                fanout.wait_empty().await;
+                tokio::select! {
+                    _ = reaper_cancel.cancelled() => {
+                        this.teardown(&reaper_key).await;
+                        break;
+                    }
+                    _ = fanout.wait_empty() => {},
+                }
                 // grace window — if someone attaches meanwhile we loop again
                 let woke = tokio::select! {
                     _ = tokio::time::sleep(grace) => true,
-                    _ = reaper_cancel.notified() => false,
+                    _ = reaper_cancel.cancelled() => false,
                 };
                 if !woke {
+                    this.teardown(&reaper_key).await;
                     break;
                 }
                 if fanout.subscriber_count() == 0 {
@@ -357,8 +424,12 @@ impl PipelineManager {
         let mut g = self.entries.lock().await;
         if let Some(e) = g.remove(key) {
             debug!(%key, "tearing down idle pipeline");
-            e.cancel.notify_waiters();
-            let kind = if e.is_transcode { "transcode" } else { "passthrough" };
+            e.cancel.cancel();
+            let kind = if e.is_transcode {
+                "transcode"
+            } else {
+                "passthrough"
+            };
             crate::telemetry::metrics::PIPELINES
                 .with_label_values(&[&key.split('|').next().unwrap_or(""), kind])
                 .dec();
@@ -376,9 +447,10 @@ impl PipelineManager {
     pub async fn shutdown(&self) {
         self.shutting_down
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.shutdown_cancel.cancel();
         let mut g = self.entries.lock().await;
         for (_, e) in g.drain() {
-            e.cancel.notify_waiters();
+            e.cancel.cancel();
         }
     }
 }

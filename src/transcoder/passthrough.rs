@@ -4,10 +4,10 @@
 //! technically unnecessary. Consumes no transcode CPU and never counts
 //! against the transcoding-pipeline limit (the manager decides that).
 
-use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 use async_trait::async_trait;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::mpsc;
 use tracing::debug;
 
 use super::traits::{EncodingProfile, StreamInput, TranscodeError, TranscodedStream, Transcoder};
@@ -32,12 +32,9 @@ impl Transcoder for PassthroughTranscoder {
         &self,
         input: StreamInput,
         _profile: EncodingProfile,
-        cancel: Arc<Notify>,
+        cancel: CancellationToken,
     ) -> Result<TranscodedStream, TranscodeError> {
-        let rx = input
-            .take_receiver()
-            .await
-            .ok_or(TranscodeError::InputClosed)?;
+        let rx = input.into_receiver();
         let (tx, out_rx) = mpsc::channel::<Result<Vec<u8>, TranscodeError>>(64);
         debug!("passthrough pipeline started");
         tokio::spawn(async move {
@@ -45,18 +42,22 @@ impl Transcoder for PassthroughTranscoder {
             loop {
                 let chunk = tokio::select! {
                     c = rx.recv() => c,
-                    _ = cancel.notified() => None,
+                    _ = cancel.cancelled() => None,
                 };
                 match chunk {
                     Some(bytes) => {
-                        if tx.send(Ok(bytes)).await.is_err() {
-                            break; // consumer gone
+                        tokio::select! {
+                            _ = cancel.cancelled() => break,
+                            result = tx.send(Ok(bytes)) => if result.is_err() { break; },
                         }
                     }
                     None => break,
                 }
             }
-            let _ = tx.send(Err(TranscodeError::OutputClosed)).await;
+            tokio::select! {
+                _ = cancel.cancelled() => {},
+                _ = tx.send(Err(TranscodeError::OutputClosed)) => {},
+            }
         });
         Ok(TranscodedStream::from_receiver(out_rx))
     }
@@ -84,7 +85,7 @@ mod tests {
             threads: 1,
         };
         let mut out = PassthroughTranscoder::new()
-            .start(input, profile, Arc::new(Notify::new()))
+            .start(input, profile, CancellationToken::new())
             .await
             .unwrap();
         tx.send(vec![1, 2, 3]).await.unwrap();

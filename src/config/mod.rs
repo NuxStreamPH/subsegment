@@ -251,7 +251,7 @@ pub struct TranscodingConfig {
     /// backend can be flipped per-environment without breaking service.
     pub backend: String,
     pub ffmpeg_path: String,
-    /// Comma-separated list of quality names (`low`, `medium`, `high`) that
+    /// List of quality names (`low`, `medium`, `high`) that
     /// the GStreamer backend should handle; every other quality stays on the
     /// FFmpeg fallback during the staged migration. Empty = all qualities.
     pub gst_qualities: Vec<String>,
@@ -275,7 +275,7 @@ pub struct TranscodingConfig {
 impl Default for TranscodingConfig {
     fn default() -> Self {
         Self {
-            backend: "ffmpeg".into(),
+            backend: "gstreamer".into(),
             ffmpeg_path: "ffmpeg".into(),
             gst_qualities: Vec::new(),
             max_concurrent: 16,
@@ -340,10 +340,15 @@ impl BroadcastConfig {
     }
     pub fn allowed_quality_names(&self) -> BTreeSet<&'static str> {
         if self.allowed_qualities.is_empty() {
-            [Quality::Low, Quality::Medium, Quality::High, Quality::Original]
-                .iter()
-                .map(|q| q.as_str())
-                .collect()
+            [
+                Quality::Low,
+                Quality::Medium,
+                Quality::High,
+                Quality::Original,
+            ]
+            .iter()
+            .map(|q| q.as_str())
+            .collect()
         } else {
             self.allowed_qualities.iter().map(|q| q.as_str()).collect()
         }
@@ -366,8 +371,7 @@ impl AppConfig {
             Figment,
         };
 
-        let explicit = path_override.is_some()
-            || std::env::var(ENV_CONFIG_PATH).is_ok();
+        let explicit = path_override.is_some() || std::env::var(ENV_CONFIG_PATH).is_ok();
         let path = path_override
             .or_else(|| std::env::var(ENV_CONFIG_PATH).ok().map(PathBuf::from))
             .unwrap_or_else(|| PathBuf::from("config.yaml"));
@@ -408,8 +412,9 @@ impl AppConfig {
         // SUBSEGMENT__SECTION__KEY style nesting.
         fig = fig.merge(Env::prefixed("SUBSEGMENT__").split("__"));
 
-        let mut cfg: AppConfig =
-            fig.extract().map_err(|e| EngineError::Config(e.to_string()))?;
+        let mut cfg: AppConfig = fig
+            .extract()
+            .map_err(|e| EngineError::Config(e.to_string()))?;
 
         // Secrets from the deployment environment (never committed).
         if let Ok(tokens) = std::env::var(ENV_TOKENS) {
@@ -536,9 +541,9 @@ streaming:
 
 transcoding:
     # "ffmpeg" | "gstreamer" | "passthrough_only"
-    # gstreamer requires a build with `--features gstreamer`; when the
-    # runtime is unavailable the engine falls back to ffmpeg automatically.
-    backend: ffmpeg
+    # GStreamer is enabled in the default build. Initialization/plugin
+    # failures use FFmpeg; --no-default-features builds use FFmpeg directly.
+    backend: gstreamer
 
     # Qualities handled by GStreamer during the staged migration
     # (empty list = all qualities). Others stay on the ffmpeg fallback.

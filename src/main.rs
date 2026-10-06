@@ -20,7 +20,7 @@ use subsegment::ingest::build_http_client;
 use subsegment::pipeline::manager::PipelineManager;
 use subsegment::security::limits::{LimitGuard, RateLimiter};
 use subsegment::telemetry;
-use subsegment::transcoder::{FfmpegTranscoder, PassthroughTranscoder, Transcoder};
+use subsegment::transcoder::{FfmpegTranscoder, Transcoder};
 
 fn parse_config_path() -> Option<std::path::PathBuf> {
     let mut args = std::env::args().skip(1);
@@ -49,20 +49,41 @@ fn parse_config_path() -> Option<std::path::PathBuf> {
 }
 
 fn build_transcoder(cfg: &Arc<AppConfig>) -> Arc<dyn Transcoder> {
-    if cfg.transcoding.backend == "passthrough_only" {
-        info!("transcoding disabled (backend=passthrough_only)");
-        return Arc::new(PassthroughTranscoder::new());
-    }
-    if FfmpegTranscoder::available(&cfg.transcoding) {
-        info!(path = %cfg.transcoding.ffmpeg_path, "ffmpeg transcoder available");
-        Arc::new(FfmpegTranscoder::new(Arc::new(cfg.transcoding.clone())))
+    use subsegment::transcoder::router::{parse_gst_qualities, BackendRouter};
+    let tc = Arc::new(cfg.transcoding.clone());
+    let primary: Option<Arc<dyn Transcoder>> = {
+        #[cfg(feature = "gstreamer")]
+        {
+            use subsegment::transcoder::gstreamer::{available, GstreamerTranscoder};
+            if tc.backend == "gstreamer" && available() {
+                info!("GStreamer primary transcoder available");
+                Some(Arc::new(GstreamerTranscoder::new(tc.clone())))
+            } else {
+                None
+            }
+        }
+        #[cfg(not(feature = "gstreamer"))]
+        {
+            None
+        }
+    };
+    let fallback: Option<Arc<dyn Transcoder>> = if tc.backend != "passthrough_only"
+        && !cfg!(feature = "gstreamer_only")
+        && FfmpegTranscoder::available(&tc)
+    {
+        info!(path = %tc.ffmpeg_path, "FFmpeg fallback available");
+        Some(Arc::new(FfmpegTranscoder::new(tc.clone())))
     } else {
-        warn!(
-            "ffmpeg not found at '{}' — falling back to passthrough-only mode",
-            cfg.transcoding.ffmpeg_path
-        );
-        Arc::new(PassthroughTranscoder::new())
+        None
+    };
+    if tc.backend != "passthrough_only" && primary.is_none() && fallback.is_none() {
+        warn!("no encoder available: transcode requests will fail; ORIGINAL remains available");
     }
+    Arc::new(BackendRouter::new(
+        primary,
+        fallback,
+        parse_gst_qualities(&tc.gst_qualities),
+    ))
 }
 
 #[tokio::main]
@@ -125,17 +146,17 @@ async fn main() -> anyhow::Result<()> {
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-        .with_graceful_shutdown(async move {
-            let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
-                .expect("installing SIGTERM handler");
-            tokio::select! {
-                _ = sigterm.recv() => info!("SIGTERM received"),
-                _ = signal::ctrl_c() => info!("SIGINT received"),
-            }
-            shutdown_manager.shutdown().await;
-        })
-        .await
-        .context("serving HTTP")?;
+    .with_graceful_shutdown(async move {
+        let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("installing SIGTERM handler");
+        tokio::select! {
+            _ = sigterm.recv() => info!("SIGTERM received"),
+            _ = signal::ctrl_c() => info!("SIGINT received"),
+        }
+        shutdown_manager.shutdown().await;
+    })
+    .await
+    .context("serving HTTP")?;
 
     info!("shutdown complete");
     Ok(())

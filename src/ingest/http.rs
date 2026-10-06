@@ -2,11 +2,13 @@
 //! extract ICY metadata and feed a bounded byte channel with automatic
 //! reconnection and capped exponential backoff.
 
+use tokio_util::sync::CancellationToken;
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::config::{AppConfig, BroadcastConfig};
@@ -141,16 +143,20 @@ async fn open_with_retries(
     client: &reqwest::Client,
     bc: &BroadcastConfig,
     want_icy: bool,
-    cancel: &Arc<Notify>,
+    cancel: &CancellationToken,
 ) -> Result<(UpstreamInfo, reqwest::Response, Option<IcyStreamSplitter>)> {
     let mut delay_ms = 250u64;
     loop {
-        match open_once(client, bc, want_icy).await {
+        let opened = tokio::select! {
+            _ = cancel.cancelled() => return Err(EngineError::UpstreamUnavailable),
+            result = open_once(client, bc, want_icy) => result,
+        };
+        match opened {
             Ok(v) => return Ok(v),
             Err(e) => {
                 let slept = tokio::time::sleep(Duration::from_millis(delay_ms));
                 tokio::select! {
-                    _ = cancel.notified() => return Err(EngineError::UpstreamUnavailable),
+                    _ = cancel.cancelled() => return Err(EngineError::UpstreamUnavailable),
                     _ = slept => {}
                 }
                 delay_ms = (delay_ms * 2).min(8_000);
@@ -170,9 +176,12 @@ pub async fn spawn_ingest(
     bc: BroadcastConfig,
     bytes_tx: mpsc::Sender<Vec<u8>>,
     meta_tx: mpsc::Sender<StreamMetadata>,
-    cancel: Arc<Notify>,
+    cancel: CancellationToken,
 ) -> Result<(UpstreamInfo, tokio::task::JoinHandle<()>)> {
-    let want_icy = matches!(bc.source.r#type, SourceType::Icecast | SourceType::Shoutcast);
+    let want_icy = matches!(
+        bc.source.r#type,
+        SourceType::Icecast | SourceType::Shoutcast
+    );
     let (info, resp, splitter) = open_with_retries(&client, &bc, want_icy, &cancel).await?;
     info!(%mountpoint, codec = ?info.codec, metaint = ?info.icy_metaint, "upstream connected");
     let _ = meta_tx.send(initial_metadata(&bc, &info)).await;
@@ -181,7 +190,6 @@ pub async fn spawn_ingest(
         client,
         bc,
         mountpoint,
-        info.clone(),
         Some(resp),
         splitter,
         bytes_tx,
@@ -197,17 +205,17 @@ async fn pump_loop(
     client: reqwest::Client,
     bc: BroadcastConfig,
     mountpoint: String,
-    initial_info: UpstreamInfo,
     mut pending: Option<reqwest::Response>,
     mut splitter: Option<IcyStreamSplitter>,
     bytes_tx: mpsc::Sender<Vec<u8>>,
     meta_tx: mpsc::Sender<StreamMetadata>,
-    cancel: Arc<Notify>,
+    cancel: CancellationToken,
 ) {
-    let want_icy = matches!(bc.source.r#type, SourceType::Icecast | SourceType::Shoutcast);
+    let want_icy = matches!(
+        bc.source.r#type,
+        SourceType::Icecast | SourceType::Shoutcast
+    );
     let read_timeout = cfg.limits.upstream_read_timeout();
-    // Track current upstream info for metadata rebuilds on reconnect.
-    let mut cur_info: Option<UpstreamInfo> = Some(initial_info);
 
     loop {
         // Obtain a body: either the one we already hold or a fresh connect.
@@ -219,11 +227,8 @@ async fn pump_loop(
                         crate::telemetry::metrics::UPSTREAM_RECONNECTS
                             .with_label_values(&[&mountpoint])
                             .inc();
-                        cur_info = Some(i);
                         splitter = s;
-                        let _ = meta_tx
-                            .send(initial_metadata(&bc, cur_info.as_ref().expect("just assigned")))
-                            .await;
+                        let _ = meta_tx.try_send(initial_metadata(&bc, &i));
                         r.bytes_stream()
                     }
                     Err(_) => break, // cancelled while retrying
@@ -236,7 +241,7 @@ async fn pump_loop(
         loop {
             let next = tokio::select! {
                 biased;
-                _ = cancel.notified() => { need_reconnect = false; break; }
+                _ = cancel.cancelled() => { need_reconnect = false; break; }
                 chunk = tokio::time::timeout(read_timeout, body.next()) => chunk,
             };
             match next {
@@ -267,12 +272,16 @@ async fn pump_loop(
                         },
                     };
                     for md in out.metadata {
-                        let _ = meta_tx.send(md).await;
+                        let _ = meta_tx.try_send(md);
                     }
-                    if !out.audio.is_empty()
-                        && bytes_tx.send(out.audio).await.is_err()
-                    {
-                        return; // pipeline consumer gone
+                    if !out.audio.is_empty() {
+                        // Bound every chunk as well as the number of queued chunks.
+                        for chunk in out.audio.chunks(64 * 1024) {
+                            tokio::select! {
+                                _ = cancel.cancelled() => return,
+                                result = bytes_tx.send(chunk.to_vec()) => if result.is_err() { return; },
+                            }
+                        }
                     }
                 }
             }

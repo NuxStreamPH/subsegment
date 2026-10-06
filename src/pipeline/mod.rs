@@ -10,3 +10,5 @@ pub mod manager;
 
 pub use fanout::{FanEvent, Fanout, Subscriber};
 pub use manager::{Attach, PipelineManager};
+
+mod ogg;
