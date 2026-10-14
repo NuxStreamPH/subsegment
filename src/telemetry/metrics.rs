@@ -56,7 +56,17 @@ pub static UPSTREAM_RECONNECTS: Lazy<CounterVec> = Lazy::new(|| {
     .expect("metrics registry")
 });
 
-/// Bytes received from upstreams.
+/// Encoder branches that exhausted their bounded ingest queue.
+pub static INGEST_BRANCH_DROPS: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "subsegment_ingest_branch_drops_total",
+        "Encoder branches cancelled because their ingest queue overflowed",
+        &["broadcast"]
+    )
+    .expect("metrics registry")
+});
+
+/// Bytes received from upstreams (counted once per download, not per output).
 pub static BYTES_RECEIVED: Lazy<CounterVec> = Lazy::new(|| {
     register_counter_vec!(
         "subsegment_bytes_received_total",

@@ -41,9 +41,9 @@ pub fn build_http_client(cfg: &AppConfig) -> Result<reqwest::Client> {
         .connect_timeout(Duration::from_secs(
             cfg.limits.upstream_connect_timeout_secs,
         ))
-        .timeout(Duration::from_secs(
-            cfg.limits.upstream_read_timeout_secs.saturating_mul(4),
-        ))
+        // A live response never finishes. A total request deadline disconnects
+        // healthy stations periodically; only time out stalled reads/headers.
+        .read_timeout(cfg.limits.upstream_read_timeout())
         .redirect(reqwest::redirect::Policy::custom(move |attempt| {
             if attempt.previous().len() >= security_cfg.limits.upstream_max_redirects {
                 return attempt.error("too many redirects");
@@ -91,7 +91,10 @@ async fn open_once(
     let resp = rb
         .send()
         .await
-        .map_err(|_| EngineError::UpstreamUnavailable)?;
+        .map_err(|err| {
+            debug!(is_timeout = err.is_timeout(), error = %err.without_url(), "upstream request failed");
+            EngineError::UpstreamUnavailable
+        })?;
     let status = resp.status();
     if !status.is_success() {
         debug!(%status, "upstream returned error status");
@@ -154,7 +157,7 @@ async fn open_with_retries(
         match opened {
             Ok(v) => return Ok(v),
             Err(e) => {
-                let slept = tokio::time::sleep(Duration::from_millis(delay_ms));
+                let slept = tokio::time::sleep(retry_delay(delay_ms));
                 tokio::select! {
                     _ = cancel.cancelled() => return Err(EngineError::UpstreamUnavailable),
                     _ = slept => {}
@@ -216,10 +219,11 @@ async fn pump_loop(
         SourceType::Icecast | SourceType::Shoutcast
     );
     let read_timeout = cfg.limits.upstream_read_timeout();
+    let mut reconnect_delay_ms = 250u64;
 
     loop {
         // Obtain a body: either the one we already hold or a fresh connect.
-        let body = match pending.take() {
+        let mut body = Box::pin(match pending.take() {
             Some(r) => r.bytes_stream(),
             None => {
                 match open_with_retries(&client, &bc, want_icy, &cancel).await {
@@ -234,8 +238,9 @@ async fn pump_loop(
                     Err(_) => break, // cancelled while retrying
                 }
             }
-        };
-        futures_util::pin_mut!(body);
+        });
+        let connection = ActiveConnection::new(&mountpoint);
+        let connected_at = tokio::time::Instant::now();
 
         let need_reconnect;
         loop {
@@ -255,8 +260,8 @@ async fn pump_loop(
                     need_reconnect = true;
                     break;
                 }
-                Ok(Some(Err(_))) => {
-                    warn!(%mountpoint, "upstream read error — reconnecting");
+                Ok(Some(Err(err))) => {
+                    warn!(%mountpoint, is_timeout = err.is_timeout(), error = %err.without_url(), "upstream read error — reconnecting");
                     need_reconnect = true;
                     break;
                 }
@@ -290,13 +295,153 @@ async fn pump_loop(
             // Cancelled mid-body: exit cleanly.
             break;
         }
+        crate::telemetry::metrics::UPSTREAM_FAILURES
+            .with_label_values(&[&mountpoint])
+            .inc();
+        // Back off even if the peer accepts HTTP and immediately closes its
+        // body. Reset only after a stable session, not after one audio chunk.
+        if connected_at.elapsed() >= Duration::from_secs(30) {
+            reconnect_delay_ms = 250;
+        }
+        drop(body);
+        drop(connection);
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = tokio::time::sleep(retry_delay(reconnect_delay_ms)) => {}
+        }
+        reconnect_delay_ms = (reconnect_delay_ms * 2).min(8_000);
     }
     debug!(%mountpoint, "ingest loop terminated");
+}
+
+fn retry_delay(base_ms: u64) -> Duration {
+    // Add bounded jitter so stations recovering together do not reconnect in
+    // lockstep. No RNG is held across an await.
+    Duration::from_millis(base_ms + rand::random::<u64>() % (base_ms / 4 + 1))
+}
+
+struct ActiveConnection(prometheus::Gauge);
+
+impl ActiveConnection {
+    fn new(mountpoint: &str) -> Self {
+        let gauge =
+            crate::telemetry::metrics::UPSTREAM_CONNECTIONS.with_label_values(&[mountpoint]);
+        gauge.inc();
+        Self(gauge)
+    }
+}
+
+impl Drop for ActiveConnection {
+    fn drop(&mut self) {
+        self.0.dec();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ingest::test_support::{config, wait_until, TestSource};
+
+    #[tokio::test]
+    async fn healthy_body_outlives_former_total_deadline() {
+        let source = TestSource::start("audio/mpeg", Some(Duration::from_millis(50))).await;
+        let (cfg, _, _) = config(&source.url);
+        let client = build_http_client(&cfg).unwrap();
+        let response = client.get(&source.url).send().await.unwrap();
+        let mut body = response.bytes_stream();
+        let started = tokio::time::Instant::now();
+        // A one-second idle limit previously imposed a four-second lifetime.
+        while started.elapsed() < Duration::from_millis(4500) {
+            tokio::time::timeout(Duration::from_secs(2), body.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(source.count(), 1);
+    }
+
+    #[tokio::test]
+    async fn stalled_body_reconnects_and_cancellation_releases_connection() {
+        let source = TestSource::start("audio/mpeg", None).await;
+        let (cfg, mount, bc) = config(&source.url);
+        let cancel = CancellationToken::new();
+        let (tx, _rx) = mpsc::channel(8);
+        let (meta, _metadata) = mpsc::channel(8);
+        let (_, task) = spawn_ingest(
+            cfg.clone(),
+            build_http_client(&cfg).unwrap(),
+            mount.clone(),
+            bc,
+            tx,
+            meta,
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+        wait_until(|| source.count() >= 2).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            crate::telemetry::metrics::UPSTREAM_CONNECTIONS
+                .with_label_values(&[&mount])
+                .get(),
+            0.0
+        );
+    }
+
+    #[tokio::test]
+    async fn immediate_eof_is_backed_off_and_backoff_is_cancellable() {
+        let source = TestSource::start("audio/mpeg", Some(Duration::ZERO)).await;
+        let (cfg, mount, bc) = config(&source.url);
+        let cancel = CancellationToken::new();
+        let (tx, _rx) = mpsc::channel(8);
+        let (meta, _metadata) = mpsc::channel(8);
+        let (_, task) = spawn_ingest(
+            cfg.clone(),
+            build_http_client(&cfg).unwrap(),
+            mount,
+            bc,
+            tx,
+            meta,
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(
+            (2..=4).contains(&source.count()),
+            "EOF retry storm: {}",
+            source.count()
+        );
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_millis(200), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn headers_are_also_subject_to_inactivity_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let (cfg, _, _) = config(&url);
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            build_http_client(&cfg).unwrap().get(url).send(),
+        )
+        .await
+        .unwrap();
+        assert!(result.unwrap_err().is_timeout());
+        server.abort();
+    }
 
     #[test]
     fn passthrough_codec_maps() {

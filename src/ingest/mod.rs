@@ -10,5 +10,9 @@ pub mod hls;
 pub mod http;
 pub mod icecast;
 pub mod shoutcast;
+pub mod shared;
+
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub use http::{build_http_client, spawn_ingest, UpstreamInfo};

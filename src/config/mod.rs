@@ -115,6 +115,12 @@ pub struct LimitsConfig {
     pub max_transcoding_pipelines: usize,
     /// Bounded fan-out buffer per listener (chunk count).
     pub listener_queue_chunks: usize,
+    /// Share one MP3/ADTS AAC upstream download across output profiles.
+    pub share_upstream: bool,
+    /// Per-encoder ingest queue; each chunk is at most 64 KiB.
+    pub ingest_queue_chunks: usize,
+    /// Total listener startup budget, including contention and retries.
+    pub pipeline_startup_timeout_secs: u64,
     /// A listener whose queue is full for longer than this gets dropped.
     pub listener_lag_timeout_secs: u64,
     /// Retain a pipeline this long after the last listener leaves.
@@ -134,6 +140,9 @@ impl Default for LimitsConfig {
             max_clients_per_broadcast: 100,
             max_transcoding_pipelines: 16,
             listener_queue_chunks: 128,
+            share_upstream: true,
+            ingest_queue_chunks: 64,
+            pipeline_startup_timeout_secs: 60,
             listener_lag_timeout_secs: 10,
             pipeline_grace_secs: 30,
             upstream_read_timeout_secs: 30,
@@ -522,6 +531,9 @@ limits:
   max_clients_per_broadcast: 100
   max_transcoding_pipelines: 16
   listener_queue_chunks: 128
+  share_upstream: true
+  ingest_queue_chunks: 64
+  pipeline_startup_timeout_secs: 60
   listener_lag_timeout_secs: 10
   pipeline_grace_secs: 300
   upstream_read_timeout_secs: 30

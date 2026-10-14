@@ -11,8 +11,8 @@ use crate::types::{Codec, Quality};
 /// Input to a transcode: a bounded stream of raw upstream audio bytes.
 ///
 /// The pipeline manager owns the receiver half and hands it to the backend
-/// exactly once; ingest feeds the sender. Bounded channel => backpressure:
-/// if the encoder cannot keep up, ingest blocks instead of growing memory.
+/// exactly once. Shared ingest feeds a bounded queue per encoder; an encoder
+/// that exhausts its queue is cancelled without blocking other profiles.
 pub struct StreamInput {
     rx: mpsc::Receiver<Vec<u8>>,
 }
