@@ -1,14 +1,10 @@
-# GStreamer primary / FFmpeg fallback integration
+# Transcoder implementation
 
-Base repository: https://github.com/staxifrage/subsegment
-Base commit: `2a5d4b6e2007e9aefce6dd6385168b3fd3cfa901`
-Prepared: 2026-10-06
+**What this doc is:** The engineering notes for the GStreamer-primary / FFmpeg-fallback work (the same change set as PR #3). Base repo commit [`2a5d4b6`](https://github.com/staxifrage/subsegment/commit/2a5d4b6e2007e9aefce6dd6385168b3fd3cfa901), prepared 2026-10-06. It's a handoff/audit record: how to apply the patch, what changed, what was validated, and what's explicitly out of scope.
 
-The archive contains the updated source under `subsegment/` and an apply-ready
-`subsegment-gstreamer-ffmpeg.patch` alongside it. No change was pushed to GitHub:
-the connected account reported read-only repository access.
+## How to apply it
 
-To apply the patch to an existing clean checkout of the base commit:
+The patch ships as `subsegment-gstreamer-ffmpeg.patch` alongside full updated source. It was never pushed by the author (their account had read-only access):
 
 ```sh
 git switch -c feat/gstreamer-primary-fallback
@@ -16,68 +12,40 @@ git apply --check /path/to/subsegment-gstreamer-ffmpeg.patch
 git apply /path/to/subsegment-gstreamer-ffmpeg.patch
 ```
 
-Alternatively, use the supplied complete source directory. Follow README.md for
-native dependencies, configuration, build commands, and runtime requirements.
-Set `transcoding.backend: gstreamer` in an existing FFmpeg configuration. The
-new default build includes GStreamer; `--no-default-features` builds without it.
+Then set `transcoding.backend: gstreamer` in existing FFmpeg configs. Default builds include GStreamer; `--no-default-features` builds without it.
 
-## What changed
+## What changed (10 items)
 
-- Replaced the non-compiling GStreamer placeholders with in-process appsrc /
-  decodebin / audio conversion / encoder / appsink sessions.
-- Wired the backend router into the crate and server startup. Per-profile
-  availability failures and failures before output retry through FFmpeg.
-- Added bounded startup replay (1 MiB) and a ten-second first-output timeout per
-  backend attempt. Once output begins, errors end the connection instead of
-  concatenating incompatible encoder sessions.
-- Added persistent cancellation through ingest, router, backend, and manager;
-  blocked queues/pipes are interrupted, GStreamer workers are joined after NULL,
-  and FFmpeg children are killed and reaped. Stderr drains beyond its log limit.
-- Removed FFmpeg's input `+nobuffer` flag, which could discard probed audio.
-- Standardized Opus on Ogg with 48 kHz sampling and `audio/ogg` response headers.
-  Ogg headers are retained for late listeners, with complete page framing.
-- Fixed first-listener header loss, duplicate-session cleanup, shutdown races,
-  and terminal fanout closure. Startup output is checked before returning a
-  successful stream response.
-- Added media/regression tests, updated Linux x86_64/ARM64 CI dependencies and
-  feature checks, and documented deployment and compatibility behavior.
-- Raised the declared Rust minimum to 1.89, matching the existing locked uuid
-  dependency rather than claiming the original incompatible 1.75 minimum.
+1. **GStreamer backend is real now** — the old non-compiling placeholders became working in-process appsrc → decodebin → convert → encoder → appsink pipelines.
+2. **Router wired into startup** — per-profile availability or pre-output failures retry through FFmpeg.
+3. **Startup replay + deadline** — up to 1 MiB of input retained and replayed to the fallback; 10s first-output timeout per backend attempt; after output starts, errors close the connection instead of splicing encoders.
+4. **Persistent cancellation** — flows through ingest → router → backend → manager; interrupts blocked queues/pipes, GStreamer workers join only after NULL, FFmpeg children are killed/reaped, stderr keeps draining past the log limit.
+5. **Removed FFmpeg's `+nobuffer` input flag** — it could discard probed audio.
+6. **Opus standardized on Ogg @ 48 kHz** with `audio/ogg` headers; headers replayed to late joiners with complete page framing.
+7. **Race/cleanup fixes** — first-listener header loss, duplicate-session cleanup, shutdown races, terminal fanout closure; startup output verified before a stream response is returned as successful.
+8. **Tests + CI** — media/regression tests added; Linux x86_64/ARM64 CI deps and feature checks updated.
+9. **Docs** — deployment and compatibility behavior documented.
+10. **Rust minimum raised 1.75 → 1.89** — to match the locked uuid dependency (the old claim was simply wrong).
 
 ## Validation actually performed
 
-Environment: Ubuntu 24.04 x86_64, Rust/Cargo 1.99.0, GStreamer 1.24.2,
-FFmpeg 6.1.1. Native libraries were extracted into a local dependency directory
-for this execution environment; normal hosts can use the apt instructions.
+Tested on Ubuntu 24.04 x86_64, Rust 1.99, GStreamer 1.24.2, FFmpeg 6.1.1:
 
 | Check | Result |
-| --- | --- |
-| `cargo test --locked` | PASS: 67 unit + 9 integration tests |
-| `cargo test --locked --no-default-features` | PASS: 67 unit + 4 integration tests |
-| `cargo check --locked --features gstreamer_only` | PASS |
-| `cargo clippy --locked --all-targets` | PASS with 5 existing style warnings |
-| rustfmt on changed Rust files | PASS |
-| `git diff --check` | PASS |
+|---|---|
+| `cargo test --locked` | ✅ 67 unit + 9 integration |
+| `cargo test --locked --no-default-features` | ✅ 67 unit + 4 integration |
+| `cargo check --features gstreamer_only` | ✅ |
+| clippy / rustfmt / `git diff --check` | ✅ (5 pre-existing style warnings) |
 
-Media tests verify encoded Opus/MP3/AAC streams by decoding with FFmpeg and
-checking codec/sample-rate with ffprobe. They also cover AAC+ delegation,
-GStreamer decoder bus errors, EOF, cancellation under backpressure, output
-receiver disconnect, late Opus joins, and manager shutdown against a local HTTP
-source. Router tests cover retained input order, timeout, replay budget, disabled
-backends, ORIGINAL, quality selection, and no retry after committed output.
+**Caveats:** the GitHub Actions workflow was edited but never run remotely; ARM64 and release-profile builds weren't tested; Rust 1.89 itself wasn't tested (only 1.99).
 
-The GitHub Actions workflow was edited but not run remotely. ARM64 and a release
-optimization build were not executed here. Rust 1.89 itself was not tested.
+**What the tests prove:** encoded Opus/MP3/AAC verified by real FFmpeg decode + ffprobe checks; AAC+ delegation, GStreamer bus errors, EOF, backpressure cancellation, receiver disconnect, late Opus joins, manager shutdown; router-level replay order, timeout, replay budget, disabled backends, ORIGINAL handling, quality selection, and no-retry-after-output.
 
-## Deliberate limits
+## Deliberate limits (what it does *not* do)
 
-- Failover is during startup, not seamless midstream recovery. Clients reconnect
-  after a running encoder fails.
-- AAC+ uses the existing FFmpeg HE-AACv2 policy when FDK is explicitly enabled;
-  otherwise it retains the existing AAC-LC fallback. GStreamer AAC+ is not claimed.
-- HLS playlist resolution/segment fetching and WMS/MMS transport remain outside
-  the existing continuous HTTP audio ingest. They are not implemented here.
-- Each quality/codec still has its own decode session; shared PCM multi-quality
-  fanout is not implemented.
-- Encoded Opus changed from WebM to Ogg. ORIGINAL passthrough is unchanged and
-  does not reconstruct arbitrary source-container initialization headers.
+- **No midstream failover** — failover happens only at startup; clients must reconnect after a running encoder dies.
+- **No GStreamer AAC+** — AAC+ stays on FFmpeg's HE-AACv2 (only when FDK is enabled), else existing AAC-LC fallback.
+- **No HLS/WMS/MMS** — only continuous HTTP byte-stream ingest (with ICY stripping).
+- **No shared decode** — each quality/codec still runs its own decoder session; shared PCM multi-quality fan-out isn't implemented.
+- **Opus container changed WebM → Ogg** (breaking for clients hard-coding `audio/webm`); ORIGINAL passthrough behavior unchanged.
