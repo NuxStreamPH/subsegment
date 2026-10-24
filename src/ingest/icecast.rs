@@ -4,9 +4,11 @@
 //! `Icy-MetaData: 1`; the shared HTTP pump already does this for sources
 //! configured with `type: icecast`.
 
+use tokio_util::sync::CancellationToken;
+
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::mpsc;
 
 use crate::config::{AppConfig, BroadcastConfig};
 use crate::error::Result;
@@ -21,7 +23,7 @@ pub async fn connect(
     bc: BroadcastConfig,
     bytes_tx: mpsc::Sender<Vec<u8>>,
     meta_tx: mpsc::Sender<StreamMetadata>,
-    cancel: Arc<Notify>,
+    cancel: CancellationToken,
 ) -> Result<(UpstreamInfo, tokio::task::JoinHandle<()>)> {
     spawn_ingest(cfg, client, mountpoint, bc, bytes_tx, meta_tx, cancel).await
 }

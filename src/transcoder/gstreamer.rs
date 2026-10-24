@@ -1,213 +1,253 @@
-//! In-process GStreamer transcoding backend (feature `gstreamer`).
-//!
-//! Pipeline shape per session — no `gst-launch` subprocesses, everything via
-//! the Rust bindings:
-//!
-//! ```text
-//! appsrc → decodebin → audioconvert → audioresample → tee
-//!   ├─ queue → opusenc   → oggmux/webmmux → appsink
-//!   ├─ queue → lamemp3enc               → appsink
-//!   └─ queue → aac encoder → aacparse/avmux_adts → appsink
-//! ```
-//!
-//! * One decode per session; the `tee` fans PCM out to every requested
-//!   quality branch, each isolated by its own `queue` so a slow encoder can
-//!   never stall the others (or the ingest pump).
-//! * ORIGINAL/passthrough never reaches this backend — the pipeline manager
-//!   and [`BackendRouter`] keep it on the zero-copy path outside of here.
-//! * Backpressure: bounded tokio channels on both sides plus non-mixing
-//!   leaky queues inside GStreamer bound memory end-to-end. Cancellation
-//!   (`Notify`) tears the pipeline down and drains its thread.
-//! * Metrics: cold-start (build + PLAYING), first-byte latency per sink,
-//!   and runtime errors are recorded against the shared Prometheus registry.
+//! In-process, bounded appsrc → decoder → encoder → appsink sessions.
+//! Blocking GStreamer operations run off the Tokio worker threads. A single
+//! supervisor owns teardown, puts the pipeline in NULL, and joins both workers.
 
-use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use futures::StreamExt;
-use gstreamer::glib;
-use gstreamer::prelude::*;
-use gstreamer::{Element, ElementFactory, Pad, PadProbeInfo, PadProbeReturn, Pipeline, Sample};
-use gstreamer_app::{AppSrc, AppSink};
-use tokio::sync::{mpsc, Notify};
-use tracing::{debug, error, info, warn};
+use gst::prelude::*;
+use gstreamer as gst;
+use gstreamer_app::{AppSink, AppSrc};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+use tracing::warn;
 
+use super::{EncodingProfile, StreamInput, TranscodeError, TranscodedStream, Transcoder};
 use crate::config::TranscodingConfig;
 use crate::telemetry::metrics;
-use crate::types::{Codec, Quality};
+use crate::types::Codec;
 
-use super::traits::{
-    EncodingProfile, SecondaryStreams, StreamInput, TranscodeError, TranscodedStream, Transcoder,
-};
-
-/// AAC encoder candidates in preference order (bad→good plugin provenance
-/// doesn't matter; we take the first element that actually constructs).
-const AAC_ENCODERS: &[&str] = &["fdkaacenc", "avenc_aac", "voaacenc", "faac"];
-
-/// An output branch: one quality (+codec) fed from the shared decoder tee.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Branch {
-    pub codec: Codec,
-    pub quality: Quality,
-    pub bitrate_bps: u32,
+fn initialize() -> Result<(), TranscodeError> {
+    static INIT: OnceLock<Result<(), String>> = OnceLock::new();
+    INIT.get_or_init(|| gst::init().map_err(|e| e.to_string()))
+        .as_ref()
+        .map(|_| ())
+        .map_err(|_| TranscodeError::Unavailable)
 }
 
-/// Ordered, de-duplicated branches for a set of profiles. Single-profile
-/// sessions get a single branch; multi-branch sessions use the shared-decode
-/// `tee` fan-out (stage 3 of the migration).
-pub fn branches_from_profiles(profiles: &[EncodingProfile]) -> Vec<Branch> {
-    let mut out: Vec<Branch> = Vec::new();
-    for p in profiles {
-        let b = Branch {
-            codec: p.codec,
-            quality: p.quality,
-            bitrate_bps: p.bitrate_bps,
-        };
-        if !out.contains(&b) {
-            out.push(b);
-        }
-    }
-    out.sort_by_key(|b| (b.quality.as_str(), b.codec.as_str()));
-    out
-}
-
-/// Container tail for a codec: `[(element, property-setters)]`.
-/// Returns `None` when no usable encoder chain exists on this host.
-fn sink_chain(branch: &Branch) -> Option<Vec<(&'static str, Vec<(&'static str, glib::Object)>)>> {
-    // NOTE: property values are applied separately (typed setters below);
-    // this list is only used for availability probing & naming.
-    match branch.codec {
-        Codec::Opus => Some(vec![("opusenc", vec![]), ("oggmux", vec![])]),
-        Codec::Mp3 | Codec::Auto => Some(vec![("lamemp3enc", vec![])]),
-        Codec::Aac | Codec::AacPlus => {
-            let enc = AAC_ENCODERS.iter().find(|e| ElementFactory::find(e).is_some())?;
-            Some(vec![(enc, vec![]), ("aacparse", vec![])])
-        }
-    }
-}
-
-/// Static availability probe used at startup: verifies the GStreamer runtime
-/// loaded and that the essential elements for our chains exist.
+/// Only probe common elements here. Missing codec plugins must not disable
+/// the whole backend: individual sessions can fall back independently.
 pub fn available() -> bool {
-    let required = [
-        "appsrc",
-        "decodebin",
-        "audioconvert",
-        "audioresample",
-        "tee",
-        "queue",
-        "appsink",
-        "opusenc",
-        "oggmux",
-        "lamemp3enc",
-    ];
-    if !required.iter().all(|f| ElementFactory::find(f).is_some()) {
-        return false;
+    initialize().is_ok()
+        && [
+            "appsrc",
+            "decodebin",
+            "audioconvert",
+            "audioresample",
+            "queue",
+            "appsink",
+        ]
+        .iter()
+        .all(|name| gst::ElementFactory::find(name).is_some())
+}
+
+fn pipeline_description(p: &EncodingProfile) -> Result<String, TranscodeError> {
+    if p.channels == 0 || p.channels > 2 || p.sample_rate == 0 || p.bitrate_bps == 0 {
+        return Err(TranscodeError::Unavailable);
     }
-    let has_aac = AAC_ENCODERS.iter().any(|e| ElementFactory::find(e).is_some())
-        && (ElementFactory::find("aacparse").is_some() || ElementFactory::find("avmux_adts").is_some());
-    has_aac
-}
-
-/// Process-global init guard: `gst::init` once, then register the bus watch
-/// that forwards async notifications into the per-session routers.
-fn ensure_gst_init() -> Result<(), TranscodeError> {
-    static INIT: std::sync::Once = std::sync::Once::new();
-    let mut err = None;
-    INIT.call_once(|| {
-        if let Err(e) = gstreamer::init(None) {
-            err = Some(format!("{e}"));
+    let tail = match p.codec {
+        Codec::Opus => format!(
+            "opusenc bitrate={} ! oggmux max-delay=100000000 max-page-delay=100000000",
+            p.bitrate_bps
+        ),
+        Codec::Mp3 | Codec::Auto => format!(
+            "lamemp3enc target=bitrate bitrate={} cbr=true ! mpegaudioparse",
+            p.bitrate_bps / 1000
+        ),
+        Codec::Aac => {
+            let encoder = ["fdkaacenc", "avenc_aac", "voaacenc"]
+                .into_iter()
+                .find(|name| gst::ElementFactory::find(name).is_some())
+                .ok_or(TranscodeError::Unavailable)?;
+            format!("{encoder} bitrate={} ! audio/mpeg,mpegversion=4,base-profile=lc ! aacparse ! audio/mpeg,mpegversion=4,stream-format=adts", p.bitrate_bps)
         }
-    });
-    match err {
-        Some(msg) => {
-            error!(%msg, "GStreamer init failed");
-            Err(TranscodeError::Unavailable)
-        }
-        None => Ok(()),
-    }
+        // HE-AAC capabilities differ across plugin builds. Keep the existing
+        // configured FFmpeg HE-AAC/AAC-LC policy instead of silently claiming HE.
+        Codec::AacPlus => return Err(TranscodeError::Unavailable),
+    };
+    let rate = if p.codec == Codec::Opus {
+        48000
+    } else {
+        p.sample_rate
+    };
+    Ok(format!(
+        "appsrc name=input block=true max-bytes=262144 format=bytes ! decodebin ! \
+         audioconvert ! audioresample ! audio/x-raw,rate={rate},channels={} ! \
+         queue max-size-buffers=0 max-size-bytes=262144 max-size-time=2000000000 ! \
+         {tail} ! appsink name=output sync=false max-buffers=8 drop=false wait-on-eos=false",
+        p.channels
+    ))
 }
 
-/// Registry mapping pipeline pointer -> weak session router, consulted from
-/// the GStreamer main-context bus watch to deliver stream-status events.
-static SESSIONS: std::lazy::SyncLazy<usize /*placeholder*/, ()>; // see below
-
-// The above placeholder never compiles — replaced by real registry:
-// (kept out intentionally; see BusRegistry below)
-
-/// Real registry: keyed by raw Pipeline pointer address.
-struct BusRegistry {
-    map: StdMutex<BTreeMap<usize, glib::WeakRef<PipelineRouter>>>,
-}
-
-use std::collections::BTreeMap;
-
-static BUS_REGISTRY: OnceCell<BusRegistry> = OnceCell::new();
-
-use once_cell::sync::OnceCell;
-
-fn registry() -> &'static BusRegistry {
-    BUS_REGISTRY.get_or_init(|| BusRegistry {
-        map: StdMutex::new(BTreeMap::new()),
-    })
-}
-
-/// Routes bus/GStreamer-thread events into a per-session mpsc. Kept alive by
-/// the session until teardown removes it from the registry.
-struct PipelineRouter {
-    tx: mpsc::Sender<Result<Vec<u8>, TranscodeError>>,
-    first_bytes: Vec<AtomicBool>,
-    started: Instant,
-    backend_label: &'static str,
-}
-
-impl PipelineRouter {
-    fn record_first_byte(&self, branch_idx: usize) {
-        if !self.first_bytes[branch_idx].swap(true, Ordering::Relaxed) {
-            metrics::TRANSCODE_FIRSTBYTE_SECONDS
-                .with_label_values(&[self.backend_label])
-                .observe(self.started.elapsed().as_secs_f64());
-        }
-    }
-}
-
-/// The in-process GStreamer transcoder.
 pub struct GstreamerTranscoder {
     cfg: Arc<TranscodingConfig>,
-    /// Extra (quality, codec) branches encoded from the same decode tee on
-    /// every session — stage 3 of the migration (shared PCM fan-out).
-    extra_branches: Vec<Branch>,
 }
 
 impl GstreamerTranscoder {
     pub fn new(cfg: Arc<TranscodingConfig>) -> Self {
-        Self {
-            cfg,
-            extra_branches: Vec::new(),
-        }
-    }
-
-    /// Enable always-on multi-branch fan-out (LOW/MEDIUM/HIGH etc.).
-    pub fn with_extra_branches(mut self, branches: Vec<Branch>) -> Self {
-        self.extra_branches = branches;
-        self
-    }
-
-    fn build_pipeline(
-        &self,
-        branches: &[Branch],
-        out_tx: &mpsc::Sender<Result<Vec<u8>, TranscodeError>>,
-    ) -> Result<(Pipeline, AppSrc, Vec<AppSink>), TranscodeError> {
-        let pipeline = Pipeline::new(Some("subsegment_transcode"));
-        let appsrc =
-            ElementFactory::make().uri("appsrc")?; // placeholder-free construction below
-        let _ = appsrc;
-        unreachable!("replaced by typed builders")
+        Self { cfg }
     }
 }
 
-#[allow(unused_variables)]
-fn typed_build_stub() {}
+#[async_trait]
+impl Transcoder for GstreamerTranscoder {
+    async fn start(
+        &self,
+        input: StreamInput,
+        profile: EncodingProfile,
+        cancel: CancellationToken,
+    ) -> Result<TranscodedStream, TranscodeError> {
+        initialize()?;
+        let started = Instant::now();
+        let description = pipeline_description(&profile)?;
+        let pipeline = gst::parse::launch(&description)
+            .map_err(|e| {
+                warn!(error = %e, "GStreamer pipeline unavailable");
+                TranscodeError::Unavailable
+            })?
+            .downcast::<gst::Pipeline>()
+            .map_err(|_| TranscodeError::Unavailable)?;
+        let appsrc = pipeline
+            .by_name("input")
+            .and_then(|e| e.downcast::<AppSrc>().ok())
+            .ok_or(TranscodeError::Unavailable)?;
+        let appsink = pipeline
+            .by_name("output")
+            .and_then(|e| e.downcast::<AppSink>().ok())
+            .ok_or(TranscodeError::Unavailable)?;
+        let bus = pipeline.bus().ok_or(TranscodeError::Unavailable)?;
+        if pipeline.set_state(gst::State::Playing).is_err() {
+            let _ = pipeline.set_state(gst::State::Null);
+            return Err(TranscodeError::Unavailable);
+        }
+        metrics::TRANSCODE_COLDSTART_SECONDS
+            .with_label_values(&["gstreamer"])
+            .observe(started.elapsed().as_secs_f64());
+        let (tx, out_rx) = mpsc::channel(self.cfg.output_queue_len.max(4));
+        let stop = cancel.child_token();
+        let pump_stop = stop.clone();
+        let mut input = input.into_receiver();
+        let runtime = tokio::runtime::Handle::current();
+        let mut pump = tokio::task::spawn_blocking(move || -> Result<(), TranscodeError> {
+            loop {
+                let chunk = runtime.block_on(async {
+                    tokio::select! {
+                        biased;
+                        _ = pump_stop.cancelled() => None,
+                        chunk = input.recv() => chunk,
+                    }
+                });
+                match chunk {
+                    Some(bytes) => {
+                        appsrc
+                            .push_buffer(gst::Buffer::from_slice(bytes))
+                            .map_err(|_| TranscodeError::ProcessFailed)?;
+                    }
+                    None => {
+                        if !pump_stop.is_cancelled() {
+                            appsrc
+                                .end_of_stream()
+                                .map_err(|_| TranscodeError::ProcessFailed)?;
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+        });
+        let pull_stop = stop.clone();
+        let pull_tx = tx.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let mut puller = tokio::task::spawn_blocking(move || -> Result<(), TranscodeError> {
+            let mut first = true;
+            while !pull_stop.is_cancelled() {
+                if let Some(sample) = appsink.try_pull_sample(gst::ClockTime::from_mseconds(100)) {
+                    let buffer = sample.buffer().ok_or(TranscodeError::ProcessFailed)?;
+                    let map = buffer
+                        .map_readable()
+                        .map_err(|_| TranscodeError::ProcessFailed)?;
+                    if map.as_slice().is_empty() {
+                        continue;
+                    }
+                    let bytes = map.as_slice().to_vec();
+                    if first {
+                        metrics::TRANSCODE_FIRSTBYTE_SECONDS
+                            .with_label_values(&["gstreamer"])
+                            .observe(started.elapsed().as_secs_f64());
+                        first = false;
+                    }
+                    let sent = runtime.block_on(async {
+                        tokio::select! {
+                            biased;
+                            _ = pull_stop.cancelled() => false,
+                            sent = pull_tx.send(Ok(bytes)) => sent.is_ok(),
+                        }
+                    });
+                    if !sent {
+                        return Ok(());
+                    }
+                } else if appsink.is_eos() {
+                    return Ok(());
+                }
+            }
+            Ok(())
+        });
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(50));
+            let mut puller_done = false;
+            let mut pump_done = false;
+            let mut result = loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break Ok(()),
+                    _ = tx.closed() => break Ok(()),
+                    result = &mut pump, if !pump_done => {
+                        pump_done = true;
+                        if !matches!(result, Ok(Ok(()))) {
+                            break Err(TranscodeError::ProcessFailed);
+                        }
+                    }
+                    result = &mut puller => {
+                        puller_done = true;
+                        break result.unwrap_or(Err(TranscodeError::ProcessFailed));
+                    }
+                    _ = tick.tick() => {
+                        if let Some(message) = bus.timed_pop_filtered(gst::ClockTime::ZERO, &[gst::MessageType::Error]) {
+                            if let gst::MessageView::Error(e) = message.view() {
+                                warn!(error = %e.error(), "GStreamer session failed");
+                            }
+                            break Err(TranscodeError::ProcessFailed);
+                        }
+                    }
+                }
+            };
+            // Error and EOS can race: do not let appsink EOS hide a bus error.
+            if bus
+                .timed_pop_filtered(gst::ClockTime::ZERO, &[gst::MessageType::Error])
+                .is_some()
+            {
+                result = Err(TranscodeError::ProcessFailed);
+            }
+            stop.cancel();
+            // NULL unblocks push_buffer; stop unblocks receive/send. Always join.
+            let _ = tokio::task::spawn_blocking(move || pipeline.set_state(gst::State::Null)).await;
+            if !pump_done {
+                let _ = pump.await;
+            }
+            if !puller_done {
+                let _ = puller.await;
+            }
+            if let Err(e) = result {
+                tokio::select! {
+                    _ = cancel.cancelled() => {},
+                    _ = tx.send(Err(e)) => {},
+                }
+            }
+        });
+        Ok(TranscodedStream::from_receiver(out_rx))
+    }
+
+    fn name(&self) -> &'static str {
+        "gstreamer"
+    }
+}

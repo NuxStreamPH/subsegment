@@ -6,7 +6,10 @@
 //! only a new implementor.
 
 pub mod ffmpeg;
+#[cfg(feature = "gstreamer")]
+pub mod gstreamer;
 pub mod passthrough;
+pub mod router;
 pub mod traits;
 
 pub use ffmpeg::FfmpegTranscoder;
@@ -18,7 +21,7 @@ use crate::types::Codec;
 /// Which container/codec an output profile requests from the backend.
 pub fn container_for(codec: Codec) -> &'static str {
     match codec {
-        Codec::Opus => "webm",
+        Codec::Opus => "ogg",
         Codec::Mp3 => "mp3",
         Codec::Aac | Codec::AacPlus => "adts",
         Codec::Auto => "mp3",
@@ -31,7 +34,7 @@ mod tests {
 
     #[test]
     fn containers() {
-        assert_eq!(container_for(Codec::Opus), "webm");
+        assert_eq!(container_for(Codec::Opus), "ogg");
         assert_eq!(container_for(Codec::Mp3), "mp3");
         assert_eq!(container_for(Codec::Aac), "adts");
     }

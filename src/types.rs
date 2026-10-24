@@ -79,7 +79,8 @@ impl Codec {
     /// MIME content type appropriate for HTTP responses.
     pub fn content_type(&self) -> &'static str {
         match self {
-            Codec::Auto | Codec::Opus => "audio/webm",
+            Codec::Opus => "audio/ogg",
+            Codec::Auto => "audio/mpeg",
             Codec::Mp3 => "audio/mpeg",
             Codec::Aac | Codec::AacPlus => "audio/aac",
         }
@@ -177,7 +178,10 @@ impl StreamMetadata {
             station: update.station.clone().or_else(|| self.station.clone()),
             codec: update.codec.clone().or_else(|| self.codec.clone()),
             bitrate: update.bitrate.or(self.bitrate),
-            content_type: update.content_type.clone().or_else(|| self.content_type.clone()),
+            content_type: update
+                .content_type
+                .clone()
+                .or_else(|| self.content_type.clone()),
         }
     }
 

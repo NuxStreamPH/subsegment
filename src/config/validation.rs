@@ -68,6 +68,12 @@ pub fn validate(cfg: &AppConfig) -> Result<()> {
     if l.listener_queue_chunks < 8 {
         errors.push("limits.listener_queue_chunks must be >= 8 (bounded fan-out)".into());
     }
+    if !(8..=1024).contains(&l.ingest_queue_chunks) {
+        errors.push("limits.ingest_queue_chunks must be within 8..=1024".into());
+    }
+    if !(1..=300).contains(&l.pipeline_startup_timeout_secs) {
+        errors.push("limits.pipeline_startup_timeout_secs must be within 1..=300".into());
+    }
     if l.pipeline_grace_secs > 3600 {
         errors.push("limits.pipeline_grace_secs should be <= 3600".into());
     }
