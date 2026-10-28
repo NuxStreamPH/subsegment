@@ -9,7 +9,7 @@ use crate::error::{EngineError, Result};
 
 use super::{AppConfig, Codec};
 
-const KNOWN_BACKENDS: &[&str] = &["ffmpeg", "passthrough_only"];
+const KNOWN_BACKENDS: &[&str] = &["ffmpeg", "gstreamer", "passthrough_only"];
 const MAX_REASONABLE_KBPS: u32 = 512;
 
 pub fn validate(cfg: &AppConfig) -> Result<()> {
@@ -32,7 +32,7 @@ pub fn validate(cfg: &AppConfig) -> Result<()> {
     {
         errors.push(
             "authentication is required but no tokens are configured \
-             (security.api_tokens or NUXSTREAM_TOKENS)"
+             (security.api_tokens or SUBSEGMENT_TOKENS)"
                 .into(),
         );
     }
@@ -67,6 +67,12 @@ pub fn validate(cfg: &AppConfig) -> Result<()> {
     }
     if l.listener_queue_chunks < 8 {
         errors.push("limits.listener_queue_chunks must be >= 8 (bounded fan-out)".into());
+    }
+    if !(8..=1024).contains(&l.ingest_queue_chunks) {
+        errors.push("limits.ingest_queue_chunks must be within 8..=1024".into());
+    }
+    if !(1..=300).contains(&l.pipeline_startup_timeout_secs) {
+        errors.push("limits.pipeline_startup_timeout_secs must be within 1..=300".into());
     }
     if l.pipeline_grace_secs > 3600 {
         errors.push("limits.pipeline_grace_secs should be <= 3600".into());
@@ -107,6 +113,14 @@ pub fn validate(cfg: &AppConfig) -> Result<()> {
     }
     if tc.max_concurrent == 0 {
         errors.push("transcoding.max_concurrent must be > 0".into());
+    }
+    for q in &tc.gst_qualities {
+        let ok = matches!(q.as_str(), "low" | "medium" | "high");
+        if !ok {
+            errors.push(format!(
+                "transcoding.gst_qualities contains '{q}' (expected low, medium or high)"
+            ));
+        }
     }
 
     // ---- broadcasts ----

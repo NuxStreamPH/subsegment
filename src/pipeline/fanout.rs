@@ -31,6 +31,8 @@ struct ListenerSlot {
 
 struct Inner {
     listeners: Mutex<HashMap<u64, ListenerSlot>>,
+    // Also serializes subscriptions with page/header publication.
+    ogg: Mutex<Option<super::ogg::OggFramer>>,
     count: AtomicU64,
     empty: Arc<Notify>,
     lag_timeout: Duration,
@@ -38,7 +40,7 @@ struct Inner {
 }
 
 impl Inner {
-    fn dispatch(&self, ev: FanEvent) {
+    fn dispatch(&self, ev: FanEvent, complete_pages: bool) {
         let mut to_remove = Vec::new();
         {
             let g = self.listeners.lock().unwrap();
@@ -49,6 +51,12 @@ impl Inner {
                         *slot.lag_since.lock().unwrap() = None;
                     }
                     Err(mpsc::error::TrySendError::Full(_)) => {
+                        if complete_pages {
+                            // A missing Ogg page breaks packet/sequence continuity.
+                            // Close this listener instead of serving damaged audio.
+                            to_remove.push(*id);
+                            continue;
+                        }
                         let now = Instant::now();
                         let mut ls = slot.lag_since.lock().unwrap();
                         // Only *start* the lag timer if the queue was drained
@@ -60,7 +68,10 @@ impl Inner {
                             Some(start) if now.duration_since(start) >= self.lag_timeout => {
                                 to_remove.push(*id);
                             }
-                            _ => {
+                            Some(start) => {
+                                *ls = Some(start);
+                            }
+                            None => {
                                 *ls = Some(now);
                             }
                         }
@@ -68,6 +79,13 @@ impl Inner {
                     Err(mpsc::error::TrySendError::Closed(_)) => to_remove.push(*id),
                 }
             }
+        }
+        if matches!(ev, FanEvent::End) {
+            let ids: Vec<_> = self.listeners.lock().unwrap().keys().copied().collect();
+            for id in ids {
+                self.remove(id);
+            }
+            return;
         }
         for id in to_remove {
             warn!(id, "dropping slow listener beyond lag budget");
@@ -152,6 +170,7 @@ impl Fanout {
         Self {
             inner: Arc::new(Inner {
                 listeners: Mutex::new(HashMap::new()),
+                ogg: Mutex::new(None),
                 count: AtomicU64::new(0),
                 empty: Arc::new(Notify::new()),
                 lag_timeout,
@@ -165,13 +184,31 @@ impl Fanout {
     /// Non-blocking broadcast into each listener's bounded queue. Memory is
     /// capped by `queue_chunks` per listener; chronically slow listeners are
     /// disconnected once they exceed their lag budget.
+    pub fn with_ogg_headers(self) -> Self {
+        *self.inner.ogg.lock().unwrap() = Some(super::ogg::OggFramer::default());
+        self
+    }
+
     pub async fn publish(&self, ev: FanEvent) {
-        self.inner.dispatch(ev);
+        let mut ogg = self.inner.ogg.lock().unwrap();
+        if let (Some(framer), FanEvent::Audio(bytes)) = (ogg.as_mut(), &ev) {
+            for page in framer.push(bytes) {
+                self.inner.dispatch(FanEvent::Audio(page), true);
+            }
+        } else {
+            self.inner.dispatch(ev, false);
+        }
     }
 
     pub fn subscribe(&self) -> Subscriber {
         let (tx, rx) = mpsc::channel(self.capacity);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let ogg = self.inner.ogg.lock().unwrap();
+        if let Some(framer) = ogg.as_ref() {
+            if !framer.headers.is_empty() {
+                let _ = tx.try_send(FanEvent::Audio(Arc::new(framer.headers.clone())));
+            }
+        }
         {
             let mut g = self.inner.listeners.lock().unwrap();
             g.insert(
@@ -183,6 +220,7 @@ impl Fanout {
             );
         }
         self.inner.count.fetch_add(1, Ordering::SeqCst);
+        drop(ogg);
         Subscriber {
             rx,
             shared: Some(Arc::new(Shared {
@@ -203,10 +241,13 @@ impl Fanout {
     /// Resolves once there are no subscribers (used for grace teardown).
     pub async fn wait_empty(&self) {
         loop {
+            let notified = self.inner.empty.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.inner.count.load(Ordering::SeqCst) == 0 {
                 return;
             }
-            self.inner.empty.notified().await;
+            notified.await;
         }
     }
 }
@@ -248,9 +289,12 @@ mod tests {
     #[tokio::test]
     async fn slow_listener_dropped_after_lag_budget() {
         let f = Fanout::new(2, Duration::from_millis(50));
-        let _keep = f.subscribe(); // healthy sink below
+        // Healthy sink: drained continuously in the background so its queue
+        // never stays full past the lag budget.
+        let mut healthy = f.subscribe();
+        let drain = tokio::spawn(async move { while healthy.rx.recv().await.is_some() {} });
         let slow = f.subscribe(); // never read
-        // Flood past the queue depth until the lag timer engages.
+                                  // Flood past the queue depth until the lag timer engages.
         for i in 0..10u8 {
             f.publish(FanEvent::Audio(Arc::new(vec![i]))).await;
         }
@@ -260,6 +304,7 @@ mod tests {
         assert!(slow.rx.is_closed());
         assert_eq!(f.dropped_slow_listeners(), 1);
         assert_eq!(f.subscriber_count(), 1);
+        drain.abort();
     }
 
     #[tokio::test]

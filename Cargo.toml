@@ -1,18 +1,18 @@
 [package]
-name = "nuxstream-stream-engine"
-version = "0.1.0"
+name = "subsegment"
+version = "0.1.4"
 edition = "2021"
-description = "NuxStream Radio stream engine: ingest, normalize, transcode and serve live broadcast streams."
+description = "A Rust-based radio stream engine that ingests, normalize, transcode and proxies broadcast streams."
 license = "MIT"
-repository = "https://github.com/nuxstream/stream-engine"
-rust-version = "1.75"
+repository = "https://github.com/nuxstream/subsegment"
+rust-version = "1.89"
 
 [lib]
-name = "nuxstream_engine"
+name = "subsegment"
 path = "src/lib.rs"
 
 [[bin]]
-name = "nuxstream-stream-engine"
+name = "subsegment"
 path = "src/main.rs"
 
 [dependencies]
@@ -38,11 +38,31 @@ sha2 = "0.10"
 thiserror = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
-tokio-util = { version = "0.7", features = ["codec", "io"] }
+tokio-util = { version = "0.7", features = ["codec", "io", "rt"] }
 tower = { version = "0.5", features = ["limit"] }
 uuid = { version = "1", features = ["v4"] }
+libc = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[features]
+default = ["gstreamer"]
+# GStreamer is the default primary. Build with --no-default-features for
+# an FFmpeg-only binary without native GStreamer link dependencies.
+gstreamer = ["dep:gstreamer", "dep:gstreamer-app"]
+
+# Route all transcode profiles through the in-process GStreamer backend with
+# no FFmpeg fallback (stage 4 of the migration — only remove ffmpeg after
+# parity is proven). Implies `gstreamer`.
+gstreamer_only = ["gstreamer"]
+
+[dependencies.gstreamer]
+version = "0.23"
+optional = true
+
+[dependencies.gstreamer-app]
+version = "0.23"
+optional = true
 
 [dev-dependencies]
 figment = { version = "0.10", features = ["yaml", "env", "test"] }

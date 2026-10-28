@@ -2,10 +2,10 @@
 //!
 //! Sources (later wins):
 //! 1. built-in defaults;
-//! 2. YAML config file (`--config path` or `NUXSTREAM_CONFIG=path`, else `./config.yaml`);
-//! 3. environment variables prefixed with `NUXSTREAM__` (figment nesting), e.g.
-//!    `NUXSTREAM__SERVER__BIND=0.0.0.0:8080`;
-//! 4. `NUXSTREAM_TOKENS=key1,key2` for bearer tokens so secrets can be
+//! 2. YAML config file (`--config path` or `SUBSEGMENT_CONFIG=path`, else `./config.yaml`);
+//! 3. environment variables prefixed with `SUBSEGMENT__` (figment nesting), e.g.
+//!    `SUBSEGMENT__SERVER__BIND=0.0.0.0:8080`;
+//! 4. `SUBSEGMENT_TOKENS=key1,key2` for bearer tokens so secrets can be
 //!    injected by the deployment environment without touching the repo.
 
 pub mod validation;
@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::{EngineError, Result};
 use crate::types::{Codec, Quality, SourceType};
 
-pub const ENV_CONFIG_PATH: &str = "NUXSTREAM_CONFIG";
-pub const ENV_TOKENS: &str = "NUXSTREAM_TOKENS";
+pub const ENV_CONFIG_PATH: &str = "SUBSEGMENT_CONFIG";
+pub const ENV_TOKENS: &str = "SUBSEGMENT_TOKENS";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -58,9 +58,9 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind: "0.0.0.0:8080".into(),
-            name: "NuxStream-Subsegment".into(),
+            name: "subsegment".into(),
             log_json: false,
-            log_level: "info,nuxstream_subsegment=info".into(),
+            log_level: "info,subsegment=info".into(),
             shutdown_timeout_secs: 15,
         }
     }
@@ -115,6 +115,12 @@ pub struct LimitsConfig {
     pub max_transcoding_pipelines: usize,
     /// Bounded fan-out buffer per listener (chunk count).
     pub listener_queue_chunks: usize,
+    /// Share one MP3/ADTS AAC upstream download across output profiles.
+    pub share_upstream: bool,
+    /// Per-encoder ingest queue; each chunk is at most 64 KiB.
+    pub ingest_queue_chunks: usize,
+    /// Total listener startup budget, including contention and retries.
+    pub pipeline_startup_timeout_secs: u64,
     /// A listener whose queue is full for longer than this gets dropped.
     pub listener_lag_timeout_secs: u64,
     /// Retain a pipeline this long after the last listener leaves.
@@ -134,6 +140,9 @@ impl Default for LimitsConfig {
             max_clients_per_broadcast: 100,
             max_transcoding_pipelines: 16,
             listener_queue_chunks: 128,
+            share_upstream: true,
+            ingest_queue_chunks: 64,
+            pipeline_startup_timeout_secs: 60,
             listener_lag_timeout_secs: 10,
             pipeline_grace_secs: 30,
             upstream_read_timeout_secs: 30,
@@ -244,9 +253,17 @@ impl StreamingConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct TranscodingConfig {
-    /// `ffmpeg` | `passthrough_only` (disable re-encoding entirely).
+    /// `ffmpeg` | `gstreamer` | `passthrough_only` (disable re-encoding entirely).
+    ///
+    /// `gstreamer` requires a binary built with `--features gstreamer`; at
+    /// startup an unavailable GStreamer runtime falls back to FFmpeg so the
+    /// backend can be flipped per-environment without breaking service.
     pub backend: String,
     pub ffmpeg_path: String,
+    /// List of quality names (`low`, `medium`, `high`) that
+    /// the GStreamer backend should handle; every other quality stays on the
+    /// FFmpeg fallback during the staged migration. Empty = all qualities.
+    pub gst_qualities: Vec<String>,
     /// Concurrent transcode hard cap independent from limits (belt & braces).
     pub max_concurrent: usize,
     pub threads_per_pipeline: u32,
@@ -254,17 +271,29 @@ pub struct TranscodingConfig {
     pub output_queue_len: usize,
     /// Set true when the local ffmpeg build includes libfdk_aac (HE-AAC).
     pub aacplus_supported: bool,
+    /// Input probe size used by FFmpeg for live streams.
+    pub probe_size: u32,
+
+    /// Maximum FFmpeg input analysis duration in microseconds.
+    pub analyze_duration_us: u32,
+
+    /// Immediately flush muxed output packets.
+    pub flush_packets: bool,
 }
 
 impl Default for TranscodingConfig {
     fn default() -> Self {
         Self {
-            backend: "ffmpeg".into(),
+            backend: "gstreamer".into(),
             ffmpeg_path: "ffmpeg".into(),
+            gst_qualities: Vec::new(),
             max_concurrent: 16,
             threads_per_pipeline: 2,
             output_queue_len: 64,
             aacplus_supported: false,
+            probe_size: 32 * 1024,
+            analyze_duration_us: 100_000,
+            flush_packets: true,
         }
     }
 }
@@ -320,10 +349,15 @@ impl BroadcastConfig {
     }
     pub fn allowed_quality_names(&self) -> BTreeSet<&'static str> {
         if self.allowed_qualities.is_empty() {
-            [Quality::Low, Quality::Medium, Quality::High, Quality::Original]
-                .iter()
-                .map(|q| q.as_str())
-                .collect()
+            [
+                Quality::Low,
+                Quality::Medium,
+                Quality::High,
+                Quality::Original,
+            ]
+            .iter()
+            .map(|q| q.as_str())
+            .collect()
         } else {
             self.allowed_qualities.iter().map(|q| q.as_str()).collect()
         }
@@ -332,32 +366,64 @@ impl BroadcastConfig {
 
 impl AppConfig {
     /// Load + validate configuration. Fails clearly on invalid input.
+    ///
+    /// When no configuration file exists — or the file is empty, as happens
+    /// when a container runtime pre-creates the mount point — and none was
+    /// explicitly requested (via `--config` or `SUBSEGMENT_CONFIG`), a
+    /// starter `config.yaml` is generated in the working directory with a
+    /// random API token and an example broadcast, and the engine starts
+    /// from it. This makes the first run of the binary succeed out of the
+    /// box while keeping secrets out of the repository.
     pub fn load(path_override: Option<PathBuf>) -> Result<Self> {
         use figment::{
             providers::{Env, Format, Serialized, Yaml},
             Figment,
         };
 
-        let explicit = path_override.is_some()
-            || std::env::var(ENV_CONFIG_PATH).is_ok();
+        let explicit = path_override.is_some() || std::env::var(ENV_CONFIG_PATH).is_ok();
         let path = path_override
             .or_else(|| std::env::var(ENV_CONFIG_PATH).ok().map(PathBuf::from))
             .unwrap_or_else(|| PathBuf::from("config.yaml"));
 
         let mut fig = Figment::from(Serialized::defaults(AppConfig::default()));
-        if path.exists() {
+        if !config_file_is_blank(&path) {
             fig = fig.merge(Yaml::file(&path));
-        } else if explicit {
+        } else if explicit && !path.exists() {
             return Err(EngineError::Config(format!(
                 "configuration file not found: {}",
                 path.display()
             )));
+        } else {
+            // First startup (file missing or blank): generate a starter
+            // configuration and use it.
+            let token = generate_api_token();
+            let template = starter_config_yaml(&token);
+            let reason = if path.exists() {
+                "configuration file exists but is empty"
+            } else {
+                "no configuration file found"
+            };
+            match std::fs::write(&path, &template) {
+                Ok(()) => eprintln!(
+                    "{reason} — generated starter configuration at '{}' \
+                     (includes a randomly generated API token; edit the file to fit your setup)",
+                    path.display()
+                ),
+                Err(e) => eprintln!(
+                    "{reason} and '{}' could not be written ({}); \
+                     continuing with the in-memory starter configuration",
+                    path.display(),
+                    e
+                ),
+            }
+            fig = fig.merge(Yaml::string(&template));
         }
-        // NUXSTREAM__SECTION__KEY style nesting.
-        fig = fig.merge(Env::prefixed("NUXSTREAM__").split("__"));
+        // SUBSEGMENT__SECTION__KEY style nesting.
+        fig = fig.merge(Env::prefixed("SUBSEGMENT__").split("__"));
 
-        let mut cfg: AppConfig =
-            fig.extract().map_err(|e| EngineError::Config(e.to_string()))?;
+        let mut cfg: AppConfig = fig
+            .extract()
+            .map_err(|e| EngineError::Config(e.to_string()))?;
 
         // Secrets from the deployment environment (never committed).
         if let Ok(tokens) = std::env::var(ENV_TOKENS) {
@@ -397,9 +463,181 @@ impl Default for AppConfig {
     }
 }
 
+/// True when `path` holds no configuration content: missing, empty or
+/// whitespace-only. Container runtimes and deployment templates commonly
+/// pre-create an empty `config.yaml` at the mount point; such a file must
+/// not suppress first-run starter generation.
+fn config_file_is_blank(path: &std::path::Path) -> bool {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => contents.trim().is_empty(),
+        // Unreadable (permissions): only treat a truly absent file as blank;
+        // let the YAML provider surface I/O errors for unreadable ones.
+        Err(_) => !path.exists(),
+    }
+}
+
+/// Random bearer token for the first-run starter configuration.
+fn generate_api_token() -> String {
+    format!("subsegment_{}", uuid::Uuid::new_v4().simple())
+}
+
+/// Starter configuration written on first startup so the binary works out of
+/// the box. It mirrors the built-in defaults, adds a random API token and one
+/// example broadcast the operator is expected to edit.
+fn starter_config_yaml(token: &str) -> String {
+    format!(
+        r#"# subsegment configuration — generated automatically on first startup.
+# Edit this file to match your deployment; it is re-read on every start.
+#
+# Precedence (later wins): built-in defaults < this file < environment:
+#   SUBSEGMENT__SECTION__KEY=value   override any key (double-underscore nesting)
+#   SUBSEGMENT_TOKENS=tok1,tok2      replace the API token list
+#   SUBSEGMENT_CONFIG=path           use a different config file
+
+server:
+  # Listen address for the HTTP API and stream endpoints.
+  bind: "0.0.0.0:8080"
+  # Public name used in headers/metadata.
+  name: "subsegment"
+  # Set true to emit JSON logs instead of human-readable text.
+  log_json: false
+  # tracing env-filter directive.
+  log_level: "info,subsegment=info"
+  # Graceful shutdown timeout (seconds).
+  shutdown_timeout_secs: 15
+
+security:
+  # Require a Bearer token on API/stream requests.
+  require_authentication: true
+  # Allow unauthenticated listeners to *stream* (API stays protected).
+  allow_anonymous_streaming: false
+  # Permit upstreams on private/loopback networks (SSRF risk — keep false
+  # unless the engine and sources live on the same trusted network).
+  allow_private_upstream_addresses: false
+  allowed_upstream_schemes: ["http", "https"]
+  # Optional hostname allowlist; empty means any public host may be contacted.
+  upstream_host_allowlist: []
+  # Static bearer tokens accepted by the engine. A random one was generated
+  # for you below — replace it or add more; or inject via SUBSEGMENT_TOKENS.
+  api_tokens:
+    - "{token}"
+  max_header_bytes: 16384
+  requests_per_second_per_ip: 20
+  request_burst_per_ip: 40
+  icy_metadata_interval_bytes: 16384
+
+limits:
+  max_clients_global: 500
+  max_clients_per_broadcast: 100
+  max_transcoding_pipelines: 16
+  listener_queue_chunks: 128
+  share_upstream: true
+  ingest_queue_chunks: 64
+  pipeline_startup_timeout_secs: 60
+  listener_lag_timeout_secs: 10
+  pipeline_grace_secs: 300
+  upstream_read_timeout_secs: 30
+  upstream_connect_timeout_secs: 10
+  upstream_max_redirects: 3
+
+streaming:
+  # Codec chosen when clients request codec=auto (opus|mp3|aac|aacplus).
+  auto_codec: mp3
+  low_kbps: 64
+  medium_kbps: 128
+  high_kbps: 192
+  # Per-codec overrides (commented out = use the generic values above):
+  #opus_low_kbps: 48
+  #opus_medium_kbps: 96
+  #opus_high_kbps: 160
+
+transcoding:
+    # "ffmpeg" | "gstreamer" | "passthrough_only"
+    # GStreamer is enabled in the default build. Initialization/plugin
+    # failures use FFmpeg; --no-default-features builds use FFmpeg directly.
+    backend: gstreamer
+
+    # Qualities handled by GStreamer during the staged migration
+    # (empty list = all qualities). Others stay on the ffmpeg fallback.
+    gst_qualities: []
+
+    ffmpeg_path: ffmpeg
+
+    max_concurrent: 16
+    threads_per_pipeline: 2
+    output_queue_len: 64
+
+    # Reduce FFmpeg cold-start analysis latency for live radio.
+    probe_size: 32768
+    analyze_duration_us: 100000
+
+    # Flush encoded packets as soon as they are produced.
+    flush_packets: true
+
+    # Set true only if FFmpeg includes libfdk_aac.
+    aacplus_supported: false
+
+broadcasts:
+  # Mountpoint id — clients stream at /stream/<id>.
+  example:
+    enabled: true
+    source:
+      # icecast | shoutcast | hls | http
+      type: http
+      # EDIT ME: point this at a real upstream audio stream.
+      url: "https://stream.example.org/live"
+    station_name: "Example Broadcast (edit me)"
+    allowed_qualities: [low, medium, high, original]
+    allowed_codecs: [mp3, opus, aac]
+    # Omit to inherit security.require_authentication.
+    authentication_required: true
+    # Extra tokens valid only for this broadcast.
+    tokens: []
+    allow_passthrough: true
+"#
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn starter_template_parses_and_validates() {
+        let token = generate_api_token();
+        assert!(token.starts_with("subsegment_"));
+        assert!(token.len() > "subsegment_".len() + 16);
+
+        let cfg: AppConfig = serde_yaml_helper(&starter_config_yaml(&token));
+        cfg.validate().unwrap();
+        assert_eq!(cfg.security.api_tokens, vec![token]);
+        assert!(cfg.broadcast("example").is_some());
+        assert_eq!(cfg.server.name, "subsegment");
+    }
+
+    #[test]
+    fn blank_config_file_is_treated_as_missing() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Missing file -> blank (starter generation applies).
+        let missing = dir.path().join("config.yaml");
+        assert!(config_file_is_blank(&missing));
+
+        // Empty file -> blank (e.g. pre-created container volume mount).
+        let empty = dir.path().join("empty.yaml");
+        std::fs::write(&empty, "").unwrap();
+        assert!(config_file_is_blank(&empty));
+
+        // Whitespace-only file -> blank.
+        let whitespace = dir.path().join("ws.yaml");
+        std::fs::write(&whitespace, "  \n\t\n").unwrap();
+        assert!(config_file_is_blank(&whitespace));
+
+        // Real content -> not blank, must be read as-is.
+        let real = dir.path().join("real.yaml");
+        std::fs::write(&real, "server:\n  bind: 127.0.0.1:9999\n").unwrap();
+        assert!(!config_file_is_blank(&real));
+    }
 
     #[test]
     fn defaults_are_valid() {

@@ -1,14 +1,14 @@
 //! HLS source adapter.
 //!
-//! v1 strategy: treat the configured URL as a directly playable media
-//! stream (many HLS publishers expose a continuous AAC/TS byte stream at
-//! the playlist's media URI, and FFmpeg itself consumes `.m3u8` URLs).
-//! When the URL points at a playlist we hand it to the transcoder backend,
-//! which demuxes segments for us; passthrough is disabled for playlists.
+//! This adapter currently accepts continuous media bytes only. Playlist
+//! fetching and segment scheduling are not implemented: neither appsrc nor
+//! FFmpeg stdin can resolve a playlist as if it were the original URL.
+
+use tokio_util::sync::CancellationToken;
 
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::mpsc;
 
 use crate::config::{AppConfig, BroadcastConfig};
 use crate::error::Result;
@@ -29,7 +29,7 @@ pub async fn connect(
     bc: BroadcastConfig,
     bytes_tx: mpsc::Sender<Vec<u8>>,
     meta_tx: mpsc::Sender<StreamMetadata>,
-    cancel: Arc<Notify>,
+    cancel: CancellationToken,
 ) -> Result<(UpstreamInfo, tokio::task::JoinHandle<()>)> {
     spawn_ingest(cfg, client, mountpoint, bc, bytes_tx, meta_tx, cancel).await
 }

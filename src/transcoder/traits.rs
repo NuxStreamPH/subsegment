@@ -1,37 +1,35 @@
 //! Backend-neutral transcoding interface.
 
-use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 
 use crate::types::{Codec, Quality};
 
 /// Input to a transcode: a bounded stream of raw upstream audio bytes.
 ///
 /// The pipeline manager owns the receiver half and hands it to the backend
-/// exactly once; ingest feeds the sender. Bounded channel => backpressure:
-/// if the encoder cannot keep up, ingest blocks instead of growing memory.
+/// exactly once. Shared ingest feeds a bounded queue per encoder; an encoder
+/// that exhausts its queue is cancelled without blocking other profiles.
 pub struct StreamInput {
-    rx: Arc<Mutex<Option<mpsc::Receiver<Vec<u8>>>>>,
+    rx: mpsc::Receiver<Vec<u8>>,
 }
 
 impl StreamInput {
     pub fn new(rx: mpsc::Receiver<Vec<u8>>) -> Self {
-        Self {
-            rx: Arc::new(Mutex::new(Some(rx))),
-        }
+        Self { rx }
     }
 
-    /// Take the receiving half. Returns `None` if already taken — a backend
-    /// must call this exactly once per pipeline.
-    pub async fn take_receiver(&self) -> Option<mpsc::Receiver<Vec<u8>>> {
-        self.rx.lock().await.take()
+    /// Transfer ownership of the bounded input channel to one backend.
+    pub fn into_receiver(self) -> mpsc::Receiver<Vec<u8>> {
+        self.rx
     }
 }
 
 /// Output of a transcode: bounded chunk stream + terminal error signal.
+#[derive(Debug)]
 pub struct TranscodedStream {
     pub rx: mpsc::Receiver<Result<Vec<u8>, TranscodeError>>,
 }
@@ -39,6 +37,19 @@ pub struct TranscodedStream {
 impl TranscodedStream {
     pub fn from_receiver(rx: mpsc::Receiver<Result<Vec<u8>, TranscodeError>>) -> Self {
         Self { rx }
+    }
+}
+
+/// Extra output streams produced by a single backend session.
+///
+/// Lets one `start()` call drive several encoder branches (e.g. a GStreamer
+/// `tee` fanning out to LOW/MEDIUM/HIGH) without changing the trait for
+/// existing single-output backends, which return an empty vector here.
+pub struct SecondaryStreams(pub Vec<TranscodedStream>);
+
+impl SecondaryStreams {
+    pub fn empty() -> Self {
+        Self(Vec::new())
     }
 }
 
@@ -84,7 +95,10 @@ pub enum TranscodeError {
 ///
 /// ```text
 /// Transcoder
-///     +-- FfmpegTranscoder          (initial implementation)
+///     +-- FfmpegTranscoder          (subprocess fallback, kept during migration)
+///     +-- GstreamerTranscoder       (in-process gst pipeline; feature "gstreamer")
+///     +-- BackendRouter            (GStreamer primary -> FFmpeg startup fallback)
+///     +-- PassthroughTranscoder     (ORIGINAL: zero-copy relay, no re-encode)
 ///     +-- NativeOpusTranscoder      (future)
 ///     +-- NativeAacTranscoder       (future)
 /// ```
@@ -100,8 +114,22 @@ pub trait Transcoder: Send + Sync {
         &self,
         input: StreamInput,
         profile: EncodingProfile,
-        cancel: Arc<tokio::sync::Notify>,
+        cancel: CancellationToken,
     ) -> Result<TranscodedStream, TranscodeError>;
+
+    /// Variant of [`start`](Self::start) that may additionally yield extra
+    /// output branches from the same decoded source (e.g. one `tee` feeding
+    /// several bitrate profiles). The default implementation delegates to
+    /// `start`, so existing backends keep working unchanged.
+    async fn start_multi(
+        &self,
+        input: StreamInput,
+        profile: EncodingProfile,
+        cancel: CancellationToken,
+    ) -> Result<(TranscodedStream, SecondaryStreams), TranscodeError> {
+        let s = self.start(input, profile, cancel).await?;
+        Ok((s, SecondaryStreams::empty()))
+    }
 
     fn name(&self) -> &'static str;
 }
